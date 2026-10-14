@@ -1,0 +1,86 @@
+services:
+  backend:
+    image: "${BACKEND_IMAGE:-som-accounting-reconciliation-backend:local}"
+    environment:
+      COMPANIES_CONFIG: /run/config/companies.json
+      RECONCILIATION_DATABASE: /data/reconciliation.sqlite3
+      RECONCILIATION_DEMO_MODE: "false"
+      OPENERP_RECONCILIATION_PASSWORD_FILE: /run/secrets/openerp_reader_password
+      ODOO_RECONCILIATION_API_KEY_FILE: /run/secrets/odoo_reader_api_key
+    volumes:
+      - "${DATA_DIR:?Set DATA_DIR}:/data"
+    deploy:
+      placement:
+        constraints:
+          - "node.hostname == ${BACKEND_NODE_HOSTNAME:?Set BACKEND_NODE_HOSTNAME}"
+      restart_policy:
+        condition: any
+    configs:
+      - source: company_profiles
+        target: /run/config/companies.json
+    secrets:
+      - openerp_reader_password
+      - odoo_reader_api_key
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/api/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  scheduler:
+    image: "${BACKEND_IMAGE:-som-accounting-reconciliation-backend:local}"
+    command: ["python", "-m", "app.scheduler"]
+    environment:
+      COMPANIES_CONFIG: /run/config/companies.json
+      RECONCILIATION_DATABASE: /data/reconciliation.sqlite3
+      OPENERP_RECONCILIATION_PASSWORD_FILE: /run/secrets/openerp_reader_password
+      ODOO_RECONCILIATION_API_KEY_FILE: /run/secrets/odoo_reader_api_key
+    volumes:
+      - "${DATA_DIR:?Set DATA_DIR}:/data"
+    configs:
+      - source: company_profiles
+        target: /run/config/companies.json
+    secrets:
+      - openerp_reader_password
+      - odoo_reader_api_key
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - "node.hostname == ${BACKEND_NODE_HOSTNAME:?Set BACKEND_NODE_HOSTNAME}"
+      restart_policy:
+        condition: any
+
+  frontend:
+    image: "${FRONTEND_IMAGE:-som-accounting-reconciliation-frontend:local}"
+    networks: [default, traefik]
+    secrets:
+      - web_htpasswd
+    deploy:
+      restart_policy:
+        condition: any
+      labels:
+        traefik.enable: "true"
+        traefik.docker.network: "${TRAEFIK_NETWORK:?Set TRAEFIK_NETWORK}"
+        traefik.http.routers.accounting-reconciliation.rule: "Host(`${APP_HOSTNAME:?Set APP_HOSTNAME}`)"
+        traefik.http.routers.accounting-reconciliation.entrypoints: "${TRAEFIK_ENTRYPOINT:?Set TRAEFIK_ENTRYPOINT}"
+        traefik.http.routers.accounting-reconciliation.tls: "true"
+        traefik.http.services.accounting-reconciliation.loadbalancer.server.port: "80"
+
+configs:
+  company_profiles:
+    file: "${COMPANIES_CONFIG_FILE:?Set COMPANIES_CONFIG_FILE}"
+
+secrets:
+  openerp_reader_password:
+    file: "${OPENERP_PASSWORD_FILE:?Set OPENERP_PASSWORD_FILE}"
+  odoo_reader_api_key:
+    file: "${ODOO_API_KEY_FILE:?Set ODOO_API_KEY_FILE}"
+  web_htpasswd:
+    file: "${WEB_AUTH_FILE:?Set WEB_AUTH_FILE}"
+
+networks:
+  traefik:
+    external: true
+    name: "${TRAEFIK_NETWORK:?Set TRAEFIK_NETWORK}"

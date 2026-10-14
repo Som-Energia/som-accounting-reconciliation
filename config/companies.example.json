@@ -1,0 +1,25 @@
+{
+  "companies": [
+    {
+      "key": "som-energia",
+      "name": "Som Energia SCCL",
+      "history_start": "2000-01-01",
+      "source": {
+        "url": "https://openerp.example.invalid",
+        "database": "openerp_database",
+        "company_id": 1,
+        "username": "reconciliation_reader",
+        "password_file_env": "OPENERP_RECONCILIATION_PASSWORD_FILE",
+        "protocol": "openerp5"
+      },
+      "target": {
+        "url": "https://odoo.example.invalid",
+        "database": "odoo_database",
+        "company_id": 1,
+        "username": "reconciliation_reader@example.invalid",
+        "password_file_env": "ODOO_RECONCILIATION_API_KEY_FILE",
+        "protocol": "odoo18"
+      }
+    }
+  ]
+}
