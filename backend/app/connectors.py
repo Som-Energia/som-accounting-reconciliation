@@ -718,6 +718,6 @@ class OdooReader:
 
 
 def make_reader(config: dict[str, Any]) -> ReadOnlyERP:
-    if config.get("protocol") == "openerp5":
+    if config.get("protocol") in {"openerp5", "erppeek"}:
         return OpenERPReader(ErpPeekReaderClient(config))
     return OdooReader(OdooXMLRPCReader(config))

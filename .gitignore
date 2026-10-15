@@ -8,3 +8,9 @@ node_modules/
 dist/
 .env
 secrets/
+config/companies.json
+config/companies.local.json
+config/.secrets/
+config/*.json_bkp
+backend/instance/
+backend/nohup.out

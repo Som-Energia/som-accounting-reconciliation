@@ -1,5 +1,6 @@
 import pytest
 
+import app.connectors as connectors
 from app.connectors import ErpPeekReaderClient, OdooXMLRPCReader
 
 
@@ -121,3 +122,15 @@ def test_connector_fails_closed_when_secret_is_missing(monkeypatch):
             },
             client_factory=FakeErpPeekFactory(),
         )
+
+
+def test_make_reader_accepts_the_erppeek_profile_protocol(monkeypatch):
+    fake_client = FakeErpPeekReaderClient()
+    monkeypatch.setattr(connectors, "ErpPeekReaderClient", lambda _config: fake_client)
+    reader = connectors.make_reader({"protocol": "erppeek"})
+    assert isinstance(reader, connectors.OpenERPReader)
+    assert reader.client is fake_client
+
+
+class FakeErpPeekReaderClient:
+    """Marker client used to verify profile dispatch without network access."""
