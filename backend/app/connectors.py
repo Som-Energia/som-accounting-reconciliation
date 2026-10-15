@@ -13,6 +13,7 @@ from .domain import JournalItem, decimal_amount
 
 
 PAGE_SIZE = 500
+ERP_ACCOUNT_BATCH_SIZE = 20
 RPC_TIMEOUT_SECONDS = 45
 
 
@@ -32,6 +33,10 @@ class _BoundedSafeTransport(xmlrpc.client.SafeTransport):
 
 class ReadOnlyERP(Protocol):
     def accounts(self, company_id: int) -> list[dict[str, Any]]: ...
+
+    def period_totals(
+        self, company_id: int, date_from: date, date_to: date, state: str
+    ) -> Any: ...
 
     def journal_items(
         self, company_id: int, date_from: date, date_to: date, state: str
@@ -101,11 +106,26 @@ class ErpPeekReaderClient:
             order="id asc",
         ) or []
 
-    def read(self, model: str, ids: list[int], field_names: list[str]) -> list[dict]:
+    def read(
+        self,
+        model: str,
+        ids: list[int],
+        field_names: list[str],
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> list[dict]:
         if not ids:
             return []
-        rows = self.client.read(model, ids, field_names)
-        return rows if isinstance(rows, list) else [rows]
+        rows = []
+        for offset in range(0, len(ids), PAGE_SIZE):
+            page = self.client.read(
+                model,
+                ids[offset:offset + PAGE_SIZE],
+                field_names,
+                context=context,
+            )
+            rows.extend(page if isinstance(page, list) else [page])
+        return rows
 
     def search_read_pages(
         self, model: str, domain: list, field_names: list[str]
@@ -235,14 +255,332 @@ class OpenERPReader:
     def accounts(self, company_id: int) -> list[dict[str, Any]]:
         fields = self.client.fields("account.account")
         requested = [name for name in ("id", "code", "name", "odoo_account_code") if name in fields]
-        ids = self.client.search("account.account", [("company_id", "=", company_id)])
-        rows = self.client.read("account.account", ids, requested)
-        return rows
+        rows = list(
+            self.client.search_read_pages(
+                "account.account", [("company_id", "=", company_id)], requested
+            )
+        )
+        return [
+            row
+            for row in rows
+            if len(str(row.get("code") or "")) == 12
+            and str(row.get("code") or "").isdigit()
+        ]
+
+    def period_totals(
+        self, company_id: int, date_from: date, date_to: date, state: str
+    ) -> dict[str, tuple[Decimal, Decimal]]:
+        """Aggregate posted AMLs inside OpenERP's indexed account function field."""
+        if state != "posted":
+            raise ValueError("OpenERP 5 aggregate totals support posted entries only.")
+        accounts = self.accounts(company_id)
+        account_ids = [int(account["id"]) for account in accounts]
+        account_by_id = {int(account["id"]): str(account.get("code") or "") for account in accounts}
+        if not account_ids:
+            return {}
+        period_ids = self.client.search(
+            "account.period",
+            [
+                ("date_start", "<=", date_to.isoformat()),
+                ("date_stop", ">=", date_from.isoformat()),
+            ],
+        )
+        if not period_ids:
+            return {code: (Decimal("0.00"), Decimal("0.00")) for code in account_by_id.values()}
+        account_fields = self.client.fields("account.account")
+        requested = [name for name in ("id", "debit", "credit") if name in account_fields]
+        context = {
+            "periods": period_ids,
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "state": "bydate",
+        }
+        totals = {}
+        for offset in range(0, len(account_ids), PAGE_SIZE):
+            rows = self.client.read(
+                "account.account",
+                account_ids[offset:offset + PAGE_SIZE],
+                requested,
+                context=context,
+            )
+            for row in rows:
+                code = account_by_id[int(row["id"])]
+                totals[code] = (
+                    decimal_amount(row.get("debit")),
+                    decimal_amount(row.get("credit")),
+                )
+        return totals
+
+    def sync_operations(
+        self, company_id: int, date_from: date, date_to: date, state: str
+    ) -> list[dict[str, Any]]:
+        """Classify invoice and entry source identities without reading every AML."""
+        if state != "posted":
+            return []
+        journals = list(self.client.search_read_pages(
+            "account.journal",
+            [("company_id", "=", company_id)],
+            ["id", "name", "som_sync_odoo_invoices", "som_sync_odoo_account_moves"],
+        ))
+        journals_by_id = {int(item["id"]): item for item in journals}
+        company_journal_ids = sorted(journals_by_id)
+        invoices = list(self.client.search_read_pages(
+            "account.invoice",
+            [
+                ("journal_id", "in", company_journal_ids),
+                ("date_invoice", ">=", date_from.isoformat()),
+                ("date_invoice", "<=", date_to.isoformat()),
+                ("state", "in", ["open", "paid"]),
+            ],
+            ["id", "move_id", "journal_id", "date_invoice", "state", "number"],
+        ))
+        operations = []
+        invoice_move_ids = set()
+        for invoice in invoices:
+            journal = journals_by_id.get(_relation_id(invoice.get("journal_id")) or -1, {})
+            move_id = _relation_id(invoice.get("move_id"))
+            if journal.get("som_sync_odoo_invoices"):
+                operations.append({
+                    "source_model": "account.invoice",
+                    "source_id": int(invoice["id"]),
+                    "move_id": move_id,
+                    "date": str(invoice.get("date_invoice") or "")[:10],
+                    "label": str(invoice.get("number") or ""),
+                    "journal": str(journal.get("name") or ""),
+                    "sync_classification": "invoice",
+                })
+            if move_id:
+                invoice_move_ids.add(move_id)
+
+        moves = list(self.client.search_read_pages(
+            "account.move",
+            [
+                ("journal_id", "in", company_journal_ids),
+                ("date", ">=", date_from.isoformat()),
+                ("date", "<=", date_to.isoformat()),
+                ("state", "in", ["posted", "valid"]),
+            ],
+            ["id", "name", "date", "state", "journal_id"],
+        ))
+        candidates = [
+            move for move in moves
+            if int(move["id"]) not in invoice_move_ids
+            and journals_by_id.get(_relation_id(move.get("journal_id")) or -1, {}).get("som_sync_odoo_account_moves")
+        ]
+        bank_account_ids = [
+            int(account["id"])
+            for account in self.accounts(company_id)
+            if str(account.get("code") or "").startswith("572")
+        ]
+        blocked_move_ids: set[int] = set()
+        for account_offset in range(0, len(bank_account_ids), ERP_ACCOUNT_BATCH_SIZE):
+            domain = [
+                ("account_id", "in", bank_account_ids[account_offset:account_offset + ERP_ACCOUNT_BATCH_SIZE]),
+                ("date", ">=", date_from.isoformat()),
+                ("date", "<=", date_to.isoformat()),
+            ]
+            for line in self.client.search_read_pages("account.move.line", domain, ["move_id"]):
+                move_id = _relation_id(line.get("move_id"))
+                if move_id:
+                    blocked_move_ids.add(move_id)
+        for move in candidates:
+            move_id = int(move["id"])
+            journal = journals_by_id.get(_relation_id(move.get("journal_id")) or -1, {})
+            if move_id in blocked_move_ids:
+                operations.append({
+                    "source_model": "account.move",
+                    "source_id": move_id,
+                    "move_id": move_id,
+                    "date": str(move.get("date") or "")[:10],
+                    "label": str(move.get("name") or ""),
+                    "journal": str(journal.get("name") or ""),
+                    "sync_classification": "excluded",
+                    "reason": "Direct general-entry synchronization excludes moves with 572 accounts.",
+                })
+                continue
+            operations.append({
+                "source_model": "account.move",
+                "source_id": move_id,
+                "move_id": move_id,
+                "date": str(move.get("date") or "")[:10],
+                "label": str(move.get("name") or ""),
+                "journal": str(journal.get("name") or ""),
+                "sync_classification": "entry",
+            })
+        return operations
+
+    def period_totals(
+        self, company_id: int, date_from: date, date_to: date, state: str
+    ) -> dict[str, tuple[Decimal, Decimal]]:
+        """Read grouped period debit/credit via OpenERP's account function fields."""
+        if state != "posted":
+            raise ValueError("OpenERP 5 aggregate totals support posted entries only.")
+        accounts = self.accounts(company_id)
+        account_ids = [int(account["id"]) for account in accounts]
+        account_by_id = {int(account["id"]): str(account.get("code") or "") for account in accounts}
+        if not account_ids:
+            return {}
+        period_ids = self.client.search(
+            "account.period",
+            [
+                ("date_start", "<=", date_to.isoformat()),
+                ("date_stop", ">=", date_from.isoformat()),
+            ],
+        )
+        if not period_ids:
+            return {}
+        fields = self.client.fields("account.account")
+        requested = [name for name in ("id", "debit", "credit") if name in fields]
+        context = {
+            "periods": period_ids,
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "state": "bydate",
+        }
+        totals = {}
+        for offset in range(0, len(account_ids), PAGE_SIZE):
+            rows = self.client.read(
+                "account.account",
+                account_ids[offset:offset + PAGE_SIZE],
+                requested,
+                context=context,
+            )
+            for row in rows:
+                account_id = int(row["id"])
+                totals[account_by_id[account_id]] = (
+                    decimal_amount(row.get("debit")),
+                    decimal_amount(row.get("credit")),
+                )
+        return totals
+
+    def sync_operations(
+        self, company_id: int, date_from: date, date_to: date, state: str
+    ) -> list[dict[str, Any]]:
+        """Classify eligible invoice/entry origins without reading all AML details."""
+        if state != "posted":
+            return []
+        accounts = self.accounts(company_id)
+        journal_fields = self.client.fields("account.journal")
+        journal_flags = [
+            name for name in ("id", "name", "som_sync_odoo_invoices", "som_sync_odoo_account_moves")
+            if name in journal_fields
+        ]
+        journal_by_id = {
+            int(journal["id"]): journal
+            for journal in self.client.search_read_pages(
+                "account.journal", [("company_id", "=", company_id)], journal_flags
+            )
+        }
+        invoice_journal_ids = sorted(
+            journal_id for journal_id, journal in journal_by_id.items()
+            if journal.get("som_sync_odoo_invoices")
+        )
+        entry_journal_ids = sorted(
+            journal_id for journal_id, journal in journal_by_id.items()
+            if journal.get("som_sync_odoo_account_moves")
+        )
+        invoices = []
+        invoice_fields = self.client.fields("account.invoice")
+        invoice_requested = [
+            name for name in ("id", "move_id", "journal_id", "date_invoice", "state", "number")
+            if name in invoice_fields
+        ]
+        if "date_invoice" in invoice_fields and invoice_journal_ids:
+            invoices = list(self.client.search_read_pages(
+                "account.invoice",
+                [
+                    ("journal_id", "in", invoice_journal_ids),
+                    ("date_invoice", ">=", date_from.isoformat()),
+                    ("date_invoice", "<=", date_to.isoformat()),
+                    ("state", "in", ["open", "paid"]),
+                ],
+                invoice_requested,
+            ))
+        operations = []
+        invoice_move_ids = set()
+        for invoice in invoices:
+            journal_id = _relation_id(invoice.get("journal_id"))
+            journal = journal_by_id.get(journal_id or -1, {})
+            move_id = _relation_id(invoice.get("move_id"))
+            if move_id:
+                invoice_move_ids.add(move_id)
+            if invoice.get("state") in {"open", "paid"} and journal.get("som_sync_odoo_invoices"):
+                operations.append({
+                    "source_model": "account.invoice",
+                    "source_id": int(invoice["id"]),
+                    "move_id": move_id,
+                    "date": str(invoice.get("date_invoice") or "")[:10],
+                    "label": str(invoice.get("number") or ""),
+                    "journal": str(journal.get("name") or ""),
+                    "sync_classification": "invoice",
+                })
+
+        move_fields = self.client.fields("account.move")
+        move_requested = [name for name in ("id", "name", "date", "state", "journal_id") if name in move_fields]
+        moves = []
+        if entry_journal_ids:
+            moves = list(self.client.search_read_pages(
+                "account.move",
+                [
+                    ("journal_id", "in", entry_journal_ids),
+                    ("date", ">=", date_from.isoformat()),
+                    ("date", "<=", date_to.isoformat()),
+                    ("state", "in", ["posted", "valid"]),
+                ],
+                move_requested,
+            ))
+        entry_candidates = [
+            move for move in moves
+            if int(move["id"]) not in invoice_move_ids
+            and journal_by_id.get(_relation_id(move.get("journal_id")) or -1, {}).get("som_sync_odoo_account_moves")
+        ]
+        bank_account_ids = [
+            int(account["id"])
+            for account in accounts
+            if str(account.get("code") or "").startswith("572")
+        ]
+        blocked_move_ids: set[int] = set()
+        if bank_account_ids:
+            for offset in range(0, len(bank_account_ids), ERP_ACCOUNT_BATCH_SIZE):
+                lines = self.client.search_read_pages(
+                    "account.move.line",
+                    [
+                        ("account_id", "in", bank_account_ids[offset:offset + ERP_ACCOUNT_BATCH_SIZE]),
+                        ("date", ">=", date_from.isoformat()),
+                        ("date", "<=", date_to.isoformat()),
+                    ],
+                    ["move_id"],
+                )
+                blocked_move_ids.update(
+                    move_id for line in lines if (move_id := _relation_id(line.get("move_id")))
+                )
+        for move in entry_candidates:
+            move_id = int(move["id"])
+            if move_id in blocked_move_ids:
+                continue
+            journal = journal_by_id.get(_relation_id(move.get("journal_id")) or -1, {})
+            operations.append({
+                "source_model": "account.move",
+                "source_id": move_id,
+                "move_id": move_id,
+                "date": str(move.get("date") or "")[:10],
+                "label": str(move.get("name") or ""),
+                "journal": str(journal.get("name") or ""),
+                "sync_classification": "entry",
+            })
+        return operations
 
     def journal_items(
-        self, company_id: int, date_from: date, date_to: date, state: str
+        self,
+        company_id: int,
+        date_from: date,
+        date_to: date,
+        state: str,
+        account_codes: set[str] | None = None,
     ) -> list[JournalItem]:
         accounts = self.accounts(company_id)
+        if account_codes is not None:
+            accounts = [account for account in accounts if account.get("code") in account_codes]
         account_ids = [int(item["id"]) for item in accounts]
         account_by_id = {int(item["id"]): item for item in accounts}
         if not account_ids:
@@ -253,12 +591,14 @@ class OpenERPReader:
             "journal_id",
         )
         fields = [name for name in wanted if name in line_fields]
-        domain = [
-            ("account_id", "in", account_ids),
-            ("date", ">=", date_from.isoformat()),
-            ("date", "<=", date_to.isoformat()),
-        ]
-        raw_lines = list(self.client.search_read_pages("account.move.line", domain, fields))
+        raw_lines = []
+        for offset in range(0, len(account_ids), ERP_ACCOUNT_BATCH_SIZE):
+            domain = [
+                ("account_id", "in", account_ids[offset:offset + ERP_ACCOUNT_BATCH_SIZE]),
+                ("date", ">=", date_from.isoformat()),
+                ("date", "<=", date_to.isoformat()),
+            ]
+            raw_lines.extend(self.client.search_read_pages("account.move.line", domain, fields))
         move_ids = sorted({mid for line in raw_lines if (mid := _relation_id(line.get("move_id")))})
         move_by_id: dict[int, dict] = {}
         if move_ids:
@@ -275,13 +615,14 @@ class OpenERPReader:
             if name in invoice_fields
         ]
         if "move_id" in invoice_fields and move_ids:
-            invoice_domain = [("move_id", "in", move_ids)]
-            for invoice in self.client.search_read_pages(
-                "account.invoice", invoice_domain, invoice_requested
-            ):
-                invoice_move_id = _relation_id(invoice.get("move_id"))
-                if invoice_move_id:
-                    invoice_by_move_id[invoice_move_id] = invoice
+            for offset in range(0, len(move_ids), ERP_ACCOUNT_BATCH_SIZE):
+                invoice_domain = [("move_id", "in", move_ids[offset:offset + ERP_ACCOUNT_BATCH_SIZE])]
+                for invoice in self.client.search_read_pages(
+                    "account.invoice", invoice_domain, invoice_requested
+                ):
+                    invoice_move_id = _relation_id(invoice.get("move_id"))
+                    if invoice_move_id:
+                        invoice_by_move_id[invoice_move_id] = invoice
         journal_ids = sorted(
             {
                 _relation_id(line.get("journal_id")) or _relation_id(move_by_id.get(_relation_id(line.get("move_id")) or -1, {}).get("journal_id"))
@@ -303,6 +644,11 @@ class OpenERPReader:
                 for journal in self.client.read("account.journal", journal_ids, journal_requested)
             }
 
+        moves_with_572 = set()
+        for row in raw_lines:
+            if str(account_by_id.get(_relation_id(row.get("account_id")) or -1, {}).get("code") or "").startswith("572"):
+                moves_with_572.add(_relation_id(row.get("move_id")))
+
         result = []
         for row in raw_lines:
             move_id = _relation_id(row.get("move_id")) or 0
@@ -315,11 +661,7 @@ class OpenERPReader:
             journal = journal_by_id.get(journal_id or -1, {})
             invoice = invoice_by_move_id.get(move_id)
             invoice_journal = journal_by_id.get(_relation_id(invoice.get("journal_id")) or -1, {}) if invoice else {}
-            has_572_account = any(
-                str(account_by_id.get(_relation_id(candidate.get("account_id")) or -1, {}).get("code") or "").startswith("572")
-                for candidate in raw_lines
-                if _relation_id(candidate.get("move_id")) == move_id
-            )
+            has_572_account = move_id in moves_with_572
             invoice_sync_eligible = bool(
                 invoice
                 and invoice.get("state") in {"open", "paid"}
@@ -371,6 +713,12 @@ class OpenERPReader:
     def cumulative_totals(
         self, company_id: int, date_to: date, state: str
     ) -> dict[str, tuple[Decimal, Decimal]] | None:
+        if getattr(self.client.client, "major_version", "") == "5.0":
+            try:
+                return self.period_totals(company_id, date(1900, 1, 1), date_to, state)
+            except Exception:
+                # Cumulative data is informational; it must not block period movement.
+                return None
         accounts = self.accounts(company_id)
         account_ids = [int(account["id"]) for account in accounts]
         if not account_ids:
@@ -379,30 +727,35 @@ class OpenERPReader:
         domain = [("account_id", "in", account_ids), ("date", "<=", date_to.isoformat())]
         if state == "posted":
             domain.append(("move_id.state", "=", "posted"))
-        groups = self.client.read_group(
-            "account.move.line", domain, ["account_id", "debit", "credit"], ["account_id"]
-        )
         totals = {}
-        if groups is None:
-            try:
-                fields = self.client.fields("account.move.line")
-                requested = [name for name in ("account_id", "debit", "credit") if name in fields]
-                for row in self.client.search_read_pages("account.move.line", domain, requested):
+        fields = self.client.fields("account.move.line")
+        requested = [name for name in ("account_id", "debit", "credit") if name in fields]
+        for offset in range(0, len(account_ids), ERP_ACCOUNT_BATCH_SIZE):
+            batch_ids = account_ids[offset:offset + ERP_ACCOUNT_BATCH_SIZE]
+            domain = [("account_id", "in", batch_ids), ("date", "<=", date_to.isoformat())]
+            if state == "posted":
+                domain.append(("move_id.state", "=", "posted"))
+            groups = self.client.read_group(
+                "account.move.line", domain, ["account_id", "debit", "credit"], ["account_id"]
+            )
+            if groups is None:
+                try:
+                    for row in self.client.search_read_pages("account.move.line", domain, requested):
+                        account_id = _relation_id(row.get("account_id"))
+                        if account_id not in account_by_id:
+                            continue
+                        code = account_by_id[account_id]
+                        debit, credit = totals.get(code, (Decimal("0.00"), Decimal("0.00")))
+                        totals[code] = (debit + decimal_amount(row.get("debit")), credit + decimal_amount(row.get("credit")))
+                except Exception:
+                    return None
+            else:
+                for row in groups:
                     account_id = _relation_id(row.get("account_id"))
-                    if account_id not in account_by_id:
-                        continue
-                    code = account_by_id[account_id]
-                    debit, credit = totals.get(code, (Decimal("0.00"), Decimal("0.00")))
-                    totals[code] = (debit + decimal_amount(row.get("debit")), credit + decimal_amount(row.get("credit")))
-            except Exception:
-                return None
-        else:
-            for row in groups:
-                account_id = _relation_id(row.get("account_id"))
-                if account_id in account_by_id:
-                    totals[account_by_id[account_id]] = (
-                        decimal_amount(row.get("debit")), decimal_amount(row.get("credit"))
-                    )
+                    if account_id in account_by_id:
+                        code = account_by_id[account_id]
+                        debit, credit = totals.get(code, (Decimal("0.00"), Decimal("0.00")))
+                        totals[code] = (debit + decimal_amount(row.get("debit")), credit + decimal_amount(row.get("credit")))
         return totals
 
     def payment_operations(self, company_id: int) -> list[dict[str, Any]]:
@@ -418,7 +771,11 @@ class OpenERPReader:
         ]
         if "company_id" not in order_fields:
             return []
-        domain = [("company_id", "=", company_id)]
+        domain = [
+            ("company_id", "=", company_id),
+            ("state", "=", "done"),
+            ("paid", "=", True),
+        ]
         orders = list(self.client.search_read_pages("payment.order", domain, wanted))
         mode_ids = sorted({_relation_id(order.get("mode")) for order in orders} - {None})
         mode_by_id: dict[int, dict] = {}
@@ -453,14 +810,29 @@ class OdooReader:
     def accounts(self, company_id: int) -> list[dict[str, Any]]:
         fields = self.client.fields("account.account")
         requested = [name for name in ("id", "code", "code_store", "name") if name in fields]
-        ids = self.client.search("account.account", [("company_ids", "in", [company_id])])
-        return self.client.read("account.account", ids, requested)
+        return list(
+            self.client.search_read_pages(
+                "account.account", [("company_ids", "in", [company_id])], requested
+            )
+        )
 
     def journal_items(
-        self, company_id: int, date_from: date, date_to: date, state: str
+        self,
+        company_id: int,
+        date_from: date,
+        date_to: date,
+        state: str,
+        account_codes: set[str] | None = None,
     ) -> list[JournalItem]:
         account_rows = self.accounts(company_id)
+        if account_codes is not None:
+            account_rows = [
+                account for account in account_rows
+                if str(account.get("code_store") or account.get("code") or "") in account_codes
+            ]
         account_by_id = {int(item["id"]): item for item in account_rows}
+        if not account_by_id:
+            return []
         fields = self.client.fields("account.move.line")
         wanted = (
             "id", "move_id", "account_id", "date", "debit", "credit", "name", "ref",
@@ -471,6 +843,7 @@ class OdooReader:
             ("company_id", "=", company_id),
             ("date", ">=", date_from.isoformat()),
             ("date", "<=", date_to.isoformat()),
+            *( [("account_id", "in", list(account_by_id))] if account_codes is not None else [] ),
         ]
         if state == "posted":
             domain.append(("parent_state", "=", "posted"))
@@ -502,19 +875,20 @@ class OdooReader:
             if name in statement_fields
         ]
         if {"move_id", "pnt_source_model", "pnt_erp_id"}.issubset(statement_fields) and move_ids:
-            statement_domain = [
-                ("company_id", "=", company_id),
-                ("move_id", "in", move_ids),
-                ("pnt_erp_id", ">", 0),
-            ]
-            for statement in self.client.search_read_pages(
-                "account.bank.statement.line", statement_domain, statement_wanted
-            ):
-                statement_move_id = _relation_id(statement.get("move_id"))
-                if statement_move_id and statement.get("pnt_source_model") and statement.get("pnt_erp_id"):
-                    statement_source_by_move[statement_move_id] = (
-                        str(statement["pnt_source_model"]), int(statement["pnt_erp_id"])
-                    )
+            for offset in range(0, len(move_ids), PAGE_SIZE):
+                statement_domain = [
+                    ("company_id", "=", company_id),
+                    ("move_id", "in", move_ids[offset:offset + PAGE_SIZE]),
+                    ("pnt_erp_id", ">", 0),
+                ]
+                for statement in self.client.search_read_pages(
+                    "account.bank.statement.line", statement_domain, statement_wanted
+                ):
+                    statement_move_id = _relation_id(statement.get("move_id"))
+                    if statement_move_id and statement.get("pnt_source_model") and statement.get("pnt_erp_id"):
+                        statement_source_by_move[statement_move_id] = (
+                            str(statement["pnt_source_model"]), int(statement["pnt_erp_id"])
+                        )
         payment_source_by_move = self._payment_move_origins(company_id, move_ids)
         journal_ids = sorted({_relation_id(line.get("journal_id")) for line in raw_lines} - {None})
         journal_by_id: dict[int, dict] = {}
@@ -573,6 +947,213 @@ class OdooReader:
                 )
             )
         return result
+
+    def period_totals(
+        self, company_id: int, date_from: date, date_to: date, state: str
+    ) -> tuple[
+        dict[str, tuple[Decimal, Decimal]],
+        dict[str, tuple[Decimal, Decimal]],
+    ]:
+        """Aggregate the full ledger and lines with a proven ERP-origin move."""
+        accounts = self.accounts(company_id)
+        account_by_id = {
+            int(account["id"]): str(account.get("code_store") or account.get("code") or "")
+            for account in accounts
+        }
+        base_domain = [
+            ("company_id", "=", company_id),
+            ("date", ">=", date_from.isoformat()),
+            ("date", "<=", date_to.isoformat()),
+        ]
+        if state == "posted":
+            base_domain.append(("parent_state", "=", "posted"))
+
+        def totals_for(domain: list) -> dict[str, tuple[Decimal, Decimal]]:
+            groups = self.client.read_group(
+                "account.move.line",
+                domain,
+                ["account_id", "debit", "credit"],
+                ["account_id"],
+            )
+            if groups is None:
+                raise RuntimeError("Odoo account movement aggregation failed.")
+            result = {}
+            for group in groups:
+                account_id = _relation_id(group.get("account_id"))
+                code = account_by_id.get(account_id or -1)
+                if code:
+                    result[code] = (
+                        decimal_amount(group.get("debit")),
+                        decimal_amount(group.get("credit")),
+                    )
+            return result
+
+        total = totals_for(base_domain)
+        move_ids: set[int] = set()
+        move_fields = self.client.fields("account.move")
+        if "pnt_erp_id" in move_fields:
+            move_domain = [
+                ("company_id", "=", company_id),
+                ("date", ">=", date_from.isoformat()),
+                ("date", "<=", date_to.isoformat()),
+                ("pnt_erp_id", ">", 0),
+            ]
+            if state == "posted":
+                move_domain.append(("state", "=", "posted"))
+            move_ids.update(
+                int(row["id"])
+                for row in self.client.search_read_pages("account.move", move_domain, ["id"])
+            )
+
+        statement_fields = self.client.fields("account.bank.statement.line")
+        if {"pnt_source_model", "pnt_erp_id", "move_id"}.issubset(statement_fields):
+            statement_domain = [
+                ("company_id", "=", company_id),
+                ("date", ">=", date_from.isoformat()),
+                ("date", "<=", date_to.isoformat()),
+                ("pnt_erp_id", ">", 0),
+            ]
+            for row in self.client.search_read_pages(
+                "account.bank.statement.line", statement_domain, ["move_id"]
+            ):
+                move_id = _relation_id(row.get("move_id"))
+                if move_id:
+                    move_ids.add(move_id)
+
+        batch_fields = self.client.fields("account.batch.payment")
+        if {"pnt_erp_id", "payment_ids"}.issubset(batch_fields):
+            batch_domain = [
+                ("company_id", "=", company_id),
+                ("date", ">=", date_from.isoformat()),
+                ("date", "<=", date_to.isoformat()),
+                ("pnt_erp_id", ">", 0),
+            ]
+            payment_ids = sorted({
+                int(payment_id)
+                for batch in self.client.search_read_pages(
+                    "account.batch.payment", batch_domain, ["payment_ids"]
+                )
+                for payment_id in (batch.get("payment_ids") or [])
+            })
+            payment_fields = self.client.fields("account.payment")
+            if payment_ids and "move_id" in payment_fields:
+                move_ids.update(
+                    move_id
+                    for payment in self.client.read("account.payment", payment_ids, ["move_id"])
+                    if (move_id := _relation_id(payment.get("move_id")))
+                )
+
+        synced: dict[str, tuple[Decimal, Decimal]] = {}
+        ordered_move_ids = sorted(move_ids)
+        for offset in range(0, len(ordered_move_ids), PAGE_SIZE):
+            domain = base_domain + [("move_id", "in", ordered_move_ids[offset:offset + PAGE_SIZE])]
+            for code, (debit, credit) in totals_for(domain).items():
+                previous_debit, previous_credit = synced.get(code, (Decimal("0.00"), Decimal("0.00")))
+                synced[code] = (previous_debit + debit, previous_credit + credit)
+        return total, synced
+
+    def period_totals(
+        self, company_id: int, date_from: date, date_to: date, state: str
+    ) -> tuple[
+        dict[str, tuple[Decimal, Decimal]],
+        dict[str, tuple[Decimal, Decimal]],
+    ]:
+        """Aggregate target movements and target moves with proven ERP origins."""
+        accounts = self.accounts(company_id)
+        account_by_id = {
+            int(account["id"]): str(account.get("code_store") or account.get("code") or "")
+            for account in accounts
+        }
+        base_domain = [
+            ("company_id", "=", company_id),
+            ("date", ">=", date_from.isoformat()),
+            ("date", "<=", date_to.isoformat()),
+        ]
+        if state == "posted":
+            base_domain.append(("parent_state", "=", "posted"))
+
+        def grouped_totals(domain: list) -> dict[str, tuple[Decimal, Decimal]]:
+            groups = self.client.read_group(
+                "account.move.line",
+                domain,
+                ["account_id", "debit", "credit"],
+                ["account_id"],
+            )
+            if groups is None:
+                raise RuntimeError("Odoo read_group failed for account.move.line.")
+            totals = {}
+            for row in groups:
+                account_id = _relation_id(row.get("account_id"))
+                code = account_by_id.get(account_id or -1)
+                if code:
+                    totals[code] = (
+                        decimal_amount(row.get("debit")),
+                        decimal_amount(row.get("credit")),
+                    )
+            return totals
+
+        total = grouped_totals(base_domain)
+        move_ids: set[int] = set()
+
+        move_fields = self.client.fields("account.move")
+        if "pnt_erp_id" in move_fields:
+            move_domain = [
+                ("company_id", "=", company_id),
+                ("date", ">=", date_from.isoformat()),
+                ("date", "<=", date_to.isoformat()),
+                ("pnt_erp_id", ">", 0),
+            ]
+            if state == "posted":
+                move_domain.append(("state", "=", "posted"))
+            move_ids.update(
+                int(row["id"])
+                for row in self.client.search_read_pages("account.move", move_domain, ["id"])
+            )
+
+        statement_fields = self.client.fields("account.bank.statement.line")
+        if {"pnt_source_model", "pnt_erp_id", "move_id"}.issubset(statement_fields):
+            statements = self.client.search_read_pages(
+                "account.bank.statement.line",
+                [
+                    ("company_id", "=", company_id),
+                    ("date", ">=", date_from.isoformat()),
+                    ("date", "<=", date_to.isoformat()),
+                    ("pnt_erp_id", ">", 0),
+                ],
+                ["move_id"],
+            )
+            move_ids.update(
+                move_id for row in statements if (move_id := _relation_id(row.get("move_id")))
+            )
+
+        batch_fields = self.client.fields("account.batch.payment")
+        if {"pnt_erp_id", "payment_ids"}.issubset(batch_fields):
+            batches = self.client.search_read_pages(
+                "account.batch.payment",
+                [
+                    ("company_id", "=", company_id),
+                    ("date", ">=", date_from.isoformat()),
+                    ("date", "<=", date_to.isoformat()),
+                    ("pnt_erp_id", ">", 0),
+                ],
+                ["payment_ids"],
+            )
+            payment_ids = sorted({payment_id for batch in batches for payment_id in (batch.get("payment_ids") or [])})
+            payment_fields = self.client.fields("account.payment")
+            if payment_ids and "move_id" in payment_fields:
+                payments = self.client.read("account.payment", payment_ids, ["move_id"])
+                move_ids.update(
+                    move_id for payment in payments if (move_id := _relation_id(payment.get("move_id")))
+                )
+
+        synced: dict[str, tuple[Decimal, Decimal]] = {}
+        move_id_list = sorted(move_ids)
+        for offset in range(0, len(move_id_list), PAGE_SIZE):
+            ids = move_id_list[offset:offset + PAGE_SIZE]
+            for code, (debit, credit) in grouped_totals(base_domain + [("move_id", "in", ids)]).items():
+                old_debit, old_credit = synced.get(code, (Decimal("0.00"), Decimal("0.00")))
+                synced[code] = (old_debit + debit, old_credit + credit)
+        return total, synced
 
     def _payment_move_origins(
         self, company_id: int, selected_move_ids: list[int]
@@ -647,29 +1228,64 @@ class OdooReader:
                     )
         return totals
 
-    def origins(self, company_id: int) -> dict[tuple[str, int], list[dict[str, Any]]]:
+    def origins(
+        self,
+        company_id: int,
+        candidates: set[tuple[str, int]] | None = None,
+    ) -> dict[tuple[str, int], list[dict[str, Any]]]:
         result: dict[tuple[str, int], list[dict[str, Any]]] = {}
         move_fields = self.client.fields("account.move")
         if {"pnt_erp_id", "move_type"}.issubset(move_fields):
             wanted = [name for name in ("id", "pnt_erp_id", "move_type", "date", "name", "state") if name in move_fields]
-            for move in self.client.search_read_pages(
-                "account.move",
-                [("company_id", "=", company_id), ("pnt_erp_id", ">", 0)],
-                wanted,
-            ):
-                source_id = int(move["pnt_erp_id"])
-                model = "account.move" if move.get("move_type") == "entry" else "account.invoice"
-                result.setdefault((model, source_id), []).append(
-                    {"target_id": int(move["id"]), "date": move.get("date"), "label": move.get("name"), "posted": move.get("state") == "posted"}
-                )
+            if candidates is None:
+                move_domains = [[("company_id", "=", company_id), ("pnt_erp_id", ">", 0)]]
+            else:
+                move_ids = sorted({
+                    source_id for model, source_id in candidates
+                    if model in {"account.move", "account.invoice"}
+                })
+                move_domains = [
+                    [
+                        ("company_id", "=", company_id),
+                        ("pnt_erp_id", "in", move_ids[offset:offset + PAGE_SIZE]),
+                    ]
+                    for offset in range(0, len(move_ids), PAGE_SIZE)
+                ]
+            for domain in move_domains:
+                for move in self.client.search_read_pages("account.move", domain, wanted):
+                    source_id = int(move["pnt_erp_id"])
+                    model = "account.move" if move.get("move_type") == "entry" else "account.invoice"
+                    if candidates is not None and (model, source_id) not in candidates:
+                        continue
+                    result.setdefault((model, source_id), []).append(
+                        {"target_id": int(move["id"]), "date": move.get("date"), "label": move.get("name"), "posted": move.get("state") == "posted"}
+                    )
         statement_fields = self.client.fields("account.bank.statement.line")
         if {"pnt_source_model", "pnt_erp_id"}.issubset(statement_fields):
             wanted = [name for name in ("id", "pnt_source_model", "pnt_erp_id", "date", "move_id") if name in statement_fields]
-            statements = list(self.client.search_read_pages(
-                "account.bank.statement.line",
-                [("company_id", "=", company_id), ("pnt_erp_id", ">", 0)],
-                wanted,
-            ))
+            if candidates is None:
+                statement_domains = [[("company_id", "=", company_id), ("pnt_erp_id", ">", 0)]]
+            else:
+                statement_domains = []
+                statement_models = sorted({
+                    model for model, _source_id in candidates
+                    if model not in {"account.move", "account.invoice", "payment.order"}
+                })
+                for model in statement_models:
+                    statement_ids = sorted(source_id for source_model, source_id in candidates if source_model == model)
+                    for offset in range(0, len(statement_ids), PAGE_SIZE):
+                        statement_domains.append([
+                            ("company_id", "=", company_id),
+                            ("pnt_source_model", "=", model),
+                            ("pnt_erp_id", "in", statement_ids[offset:offset + PAGE_SIZE]),
+                        ])
+            statements = [
+                statement
+                for domain in statement_domains
+                for statement in self.client.search_read_pages(
+                    "account.bank.statement.line", domain, wanted
+                )
+            ]
             statement_move_ids = sorted({_relation_id(item.get("move_id")) for item in statements} - {None})
             posted_moves: set[int] = set()
             if statement_move_ids:
@@ -689,31 +1305,39 @@ class OdooReader:
         batch_fields = self.client.fields("account.batch.payment")
         if "pnt_erp_id" in batch_fields:
             wanted = [name for name in ("id", "pnt_erp_id", "date", "name", "payment_ids") if name in batch_fields]
-            for batch in self.client.search_read_pages(
-                "account.batch.payment",
-                [("company_id", "=", company_id), ("pnt_erp_id", ">", 0)],
-                wanted,
-            ):
-                key = ("payment.order", int(batch["pnt_erp_id"]))
-                payment_ids = batch.get("payment_ids") or []
-                payment_moves: list[int] = []
-                if payment_ids:
-                    payment_fields = self.client.fields("account.payment")
-                    if "move_id" in payment_fields:
-                        payment_rows = self.client.read("account.payment", payment_ids, ["id", "move_id"])
-                        payment_moves = [
-                            move_id for payment in payment_rows
-                            if (move_id := _relation_id(payment.get("move_id")))
-                        ]
-                posted = False
-                if payment_moves:
-                    payment_move_rows = self.client.read("account.move", payment_moves, ["id", "state"])
-                    posted = len(payment_moves) == len(payment_ids) and all(
-                        move.get("state") == "posted" for move in payment_move_rows
+            if candidates is None:
+                batch_domains = [[("company_id", "=", company_id), ("pnt_erp_id", ">", 0)]]
+            else:
+                batch_ids = sorted(source_id for model, source_id in candidates if model == "payment.order")
+                batch_domains = [
+                    [
+                        ("company_id", "=", company_id),
+                        ("pnt_erp_id", "in", batch_ids[offset:offset + PAGE_SIZE]),
+                    ]
+                    for offset in range(0, len(batch_ids), PAGE_SIZE)
+                ]
+            for domain in batch_domains:
+                for batch in self.client.search_read_pages("account.batch.payment", domain, wanted):
+                    key = ("payment.order", int(batch["pnt_erp_id"]))
+                    payment_ids = batch.get("payment_ids") or []
+                    payment_moves: list[int] = []
+                    if payment_ids:
+                        payment_fields = self.client.fields("account.payment")
+                        if "move_id" in payment_fields:
+                            payment_rows = self.client.read("account.payment", payment_ids, ["id", "move_id"])
+                            payment_moves = [
+                                move_id for payment in payment_rows
+                                if (move_id := _relation_id(payment.get("move_id")))
+                            ]
+                    posted = False
+                    if payment_moves:
+                        payment_move_rows = self.client.read("account.move", payment_moves, ["id", "state"])
+                        posted = len(payment_moves) == len(payment_ids) and all(
+                            move.get("state") == "posted" for move in payment_move_rows
+                        )
+                    result.setdefault(key, []).append(
+                        {"target_id": int(batch["id"]), "date": batch.get("date"), "label": batch.get("name"), "posted": posted}
                     )
-                result.setdefault(key, []).append(
-                    {"target_id": int(batch["id"]), "date": batch.get("date"), "label": batch.get("name"), "posted": posted}
-                )
         return result
 
 

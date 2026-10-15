@@ -5,10 +5,11 @@ from typing import Any
 
 from flask import Blueprint, current_app, jsonify, request
 
+from .connectors import make_reader
 from .demo import demo_report
 from .profiles import load_profiles, public_profiles
-from .reconciliation import build_report
-from .storage import detect_retroactive_changes, get_run, list_issues, list_items, list_runs, review_issue, save_run
+from .reconciliation import _serialize_line, build_report
+from .storage import detect_retroactive_changes, get_run, list_issues, list_items, list_runs, previous_snapshot_date_to, review_issue, save_run
 
 
 api = Blueprint("api", __name__)
@@ -54,10 +55,26 @@ def create_run() -> tuple:
         )
         if profile is None:
             raise ValueError("Select a configured company.")
+        previous_date = previous_snapshot_date_to(
+            current_app.config["DATABASE"],
+            company_key,
+            date_from.isoformat(),
+            date_to.isoformat(),
+            state_filter,
+            scope,
+        )
+        previous_date_to = date.fromisoformat(previous_date) if previous_date else None
         if company_key == "demo":
             report = demo_report(date_from, date_to, state_filter, scope)
         else:
-            report = build_report(profile, date_from, date_to, state_filter, scope)
+            report = build_report(
+                profile,
+                date_from,
+                date_to,
+                state_filter,
+                scope,
+                comparison_date_to=previous_date_to,
+            )
         report["issues"].extend(detect_retroactive_changes(current_app.config["DATABASE"], report))
         report["totals"]["issue_count"] = len(report["issues"])
         return jsonify(save_run(current_app.config["DATABASE"], report)), 201
@@ -100,7 +117,8 @@ def run_issues(run_id: str) -> tuple:
 
 @api.get("/runs/<run_id>/accounts/<account_code>/items")
 def account_items(run_id: str, account_code: str) -> tuple:
-    if get_run(current_app.config["DATABASE"], run_id) is None:
+    report = get_run(current_app.config["DATABASE"], run_id)
+    if report is None:
         return jsonify({"error": "Run not found."}), 404
     try:
         system = request.args.get("system", "source")
@@ -114,6 +132,36 @@ def account_items(run_id: str, account_code: str) -> tuple:
             offset=offset,
             limit=limit,
         )
+        if total == 0 and report.get("details_mode") == "live":
+            profile = next(
+                (item for item in _profiles() if item["key"] == report["company"]["key"]),
+                None,
+            )
+            account_row = next(
+                (item for item in report["accounts"] if item["account_code"] == account_code),
+                None,
+            )
+            if profile is None or account_row is None:
+                return jsonify({"items": [], "offset": offset, "limit": limit, "total": 0}), 200
+            config = profile["source"] if system == "source" else profile["target"]
+            reader = make_reader(config)
+            account_filter = (
+                set(account_row.get("source_account_codes") or [])
+                if system == "source"
+                else {account_code}
+            )
+            if not account_filter:
+                return jsonify({"items": [], "offset": offset, "limit": limit, "total": 0}), 200
+            lines = reader.journal_items(
+                int(config["company_id"]),
+                date.fromisoformat(report["date_from"]),
+                date.fromisoformat(report["date_to"]),
+                report["state_filter"],
+                account_codes=account_filter,
+            )
+            items = [_serialize_line(line) for line in lines]
+            total = len(items)
+            items = items[offset:offset + min(max(limit, 1), 500)]
         return jsonify({"items": items, "offset": offset, "limit": min(max(limit, 1), 500), "total": total}), 200
     except ValueError as error:
         return jsonify({"error": str(error)}), 400

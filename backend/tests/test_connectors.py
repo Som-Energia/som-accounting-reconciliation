@@ -1,7 +1,9 @@
 import pytest
+from datetime import date
+from types import SimpleNamespace
 
 import app.connectors as connectors
-from app.connectors import ErpPeekReaderClient, OdooXMLRPCReader
+from app.connectors import ErpPeekReaderClient, OdooReader, OdooXMLRPCReader, OpenERPReader, PAGE_SIZE
 
 
 class FakeErpPeekClient:
@@ -18,7 +20,7 @@ class FakeErpPeekClient:
         self.calls.append((model, "search", domain, kwargs))
         return [1]
 
-    def read(self, model, ids, fields):
+    def read(self, model, ids, fields, *, context=None):
         self.calls.append((model, "read", ids, fields))
         return [{"id": 1, "name": "Test"}]
 
@@ -134,3 +136,91 @@ def test_make_reader_accepts_the_erppeek_profile_protocol(monkeypatch):
 
 class FakeErpPeekReaderClient:
     """Marker client used to verify profile dispatch without network access."""
+
+
+class FakeAccountReaderClient:
+    def fields(self, _model):
+        return {"id", "code", "name", "odoo_account_code"}
+
+    def search(self, _model, _domain, **_kwargs):
+        return [1, 2, 3]
+
+    def read(self, _model, ids, _fields):
+        return [
+            {"id": 1, "code": "430000000001", "name": "Posting account", "odoo_account_code": "430000001"},
+            {"id": 2, "code": "430", "name": "Parent account", "odoo_account_code": ""},
+            {"id": 3, "code": "12345678901", "name": "Short account", "odoo_account_code": ""},
+        ]
+
+    def search_read_pages(self, model, domain, fields):
+        yield from self.read(model, self.search(model, domain), fields)
+
+    def search(self, _model, _domain):
+        return [1, 2, 3]
+
+
+class PagedAccountClient:
+    def __init__(self, rows):
+        self.rows = rows
+        self.offsets = []
+
+    def fields(self, _model):
+        return set(self.rows[0])
+
+    def search(self, _model, _domain, *, offset=0):
+        self.offsets.append(offset)
+        return [row["id"] for row in self.rows[offset:offset + PAGE_SIZE]]
+
+    def read(self, _model, ids, field_names):
+        id_set = set(ids)
+        return [
+            {field: row[field] for field in field_names if field in row}
+            for row in self.rows if row["id"] in id_set
+        ]
+
+    def search_read_pages(self, model, domain, fields):
+        offset = 0
+        while True:
+            ids = self.search(model, domain, offset=offset)
+            if not ids:
+                return
+            yield from self.read(model, ids, fields)
+            offset += len(ids)
+            if len(ids) < PAGE_SIZE:
+                return
+
+
+def test_openerp_account_list_ignores_parent_codes_shorter_than_twelve_digits():
+    accounts = OpenERPReader(FakeAccountReaderClient()).accounts(company_id=1)
+    assert [account["code"] for account in accounts] == ["430000000001"]
+
+
+def test_account_connectors_read_beyond_the_first_five_hundred_records():
+    source_rows = [
+        {"id": number, "code": str(number).zfill(12), "name": "Posting", "odoo_account_code": "100000000"}
+        for number in range(1, PAGE_SIZE + 2)
+    ]
+    source_rows.append({"id": PAGE_SIZE + 2, "code": "1", "name": "Parent", "odoo_account_code": ""})
+    source_client = PagedAccountClient(source_rows)
+    source_accounts = OpenERPReader(source_client).accounts(company_id=1)
+    assert len(source_accounts) == PAGE_SIZE + 1
+    assert source_client.offsets == [0, PAGE_SIZE]
+
+    target_rows = [
+        {"id": number, "code": str(number).zfill(9), "code_store": str(number).zfill(9), "name": "Target"}
+        for number in range(1, PAGE_SIZE + 2)
+    ]
+    target_client = PagedAccountClient(target_rows)
+    target_accounts = OdooReader(target_client).accounts(company_id=1)
+    assert len(target_accounts) == PAGE_SIZE + 1
+    assert target_client.offsets == [0, PAGE_SIZE]
+
+
+def test_open_erp_cumulative_timeout_does_not_block_period_comparison(monkeypatch):
+    reader = OpenERPReader(SimpleNamespace(client=SimpleNamespace(major_version="5.0")))
+
+    def timeout(*_args):
+        raise TimeoutError
+
+    monkeypatch.setattr(reader, "period_totals", timeout)
+    assert reader.cumulative_totals(1, date(2026, 10, 14), "posted") is None

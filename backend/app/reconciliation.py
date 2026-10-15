@@ -53,6 +53,512 @@ def _origin_index(lines: list[JournalItem]) -> dict[tuple[str, int], set[int]]:
     return index
 
 
+def _build_aggregate_report(
+    profile: dict[str, Any],
+    date_from: date,
+    date_to: date,
+    state_filter: str,
+    scope: str,
+    source: Any,
+    target: Any,
+    source_accounts: list[dict[str, Any]],
+    target_accounts: list[dict[str, Any]],
+    account_mapping: dict[str, tuple[str, str]],
+    issues: list[dict[str, Any]],
+    comparison_date_to: date | None = None,
+) -> dict[str, Any]:
+    """Use ERP-side account aggregates and load AML details only on drill-down."""
+    source_totals = source.period_totals(
+        int(profile["source"]["company_id"]), date_from, date_to, state_filter
+    )
+    target_totals, target_synced = target.period_totals(
+        int(profile["target"]["company_id"]), date_from, date_to, state_filter
+    )
+    source_by_target: dict[str, dict[str, Decimal]] = defaultdict(
+        lambda: {"debit": Decimal("0.00"), "credit": Decimal("0.00")}
+    )
+    source_codes_by_target: dict[str, set[str]] = defaultdict(set)
+    for source_code, (debit, credit) in source_totals.items():
+        mapped = account_mapping.get(source_code)
+        if not mapped:
+            continue
+        target_code, _target_name = mapped
+        source_by_target[target_code]["debit"] += debit
+        source_by_target[target_code]["credit"] += credit
+        source_codes_by_target[target_code].add(source_code)
+
+    target_names = {
+        str(account.get("code_store") or account.get("code") or ""): str(account.get("name") or "")
+        for account in target_accounts
+    }
+    codes = sorted(
+        set(source_by_target)
+        | set(target_totals)
+        | {account_mapping[code][0] for code in account_mapping}
+    )
+    age_cutoff = _next_month_close(date_to)
+    today = datetime.now(ZoneInfo("Europe/Madrid")).date()
+    rows = []
+    for code in codes:
+        expected = source_by_target.get(
+            code, {"debit": Decimal("0.00"), "credit": Decimal("0.00")}
+        )
+        actual = target_totals.get(code, (Decimal("0.00"), Decimal("0.00")))
+        synced = target_synced.get(code, (Decimal("0.00"), Decimal("0.00")))
+        native = (actual[0] - synced[0], actual[1] - synced[1])
+        debit_difference = expected["debit"] - actual[0]
+        credit_difference = expected["credit"] - actual[1]
+        balance_difference = (expected["debit"] - expected["credit"]) - (actual[0] - actual[1])
+        status = "balanced"
+        if debit_difference or credit_difference:
+            status = "movement_difference" if today > age_cutoff else "temporal_difference"
+            issues.append(
+                {
+                    "type": status,
+                    "account_code": code,
+                    "title": f"Movement difference on Odoo account {code}.",
+                    "details": {
+                        "date_from": date_from.isoformat(),
+                        "date_to": date_to.isoformat(),
+                        "ageing_cutoff": age_cutoff.isoformat(),
+                        "scope": scope,
+                        "debit_difference": amount_text(debit_difference),
+                        "credit_difference": amount_text(credit_difference),
+                        "balance_difference": amount_text(balance_difference),
+                    },
+                }
+            )
+        rows.append(
+            {
+                "account_code": code,
+                "account_name": target_names.get(code, ""),
+                "source_account_codes": sorted(source_codes_by_target.get(code, set())),
+                "source_debit": amount_text(expected["debit"]),
+                "source_credit": amount_text(expected["credit"]),
+                "pending_debit": "0.00",
+                "pending_credit": "0.00",
+                "target_synced_debit": amount_text(synced[0]),
+                "target_synced_credit": amount_text(synced[1]),
+                "target_native_debit": amount_text(native[0]),
+                "target_native_credit": amount_text(native[1]),
+                "target_debit": amount_text(actual[0]),
+                "target_credit": amount_text(actual[1]),
+                "debit_difference": amount_text(debit_difference),
+                "credit_difference": amount_text(credit_difference),
+                "balance_difference": amount_text(balance_difference),
+                "definitive_balance_difference": amount_text(balance_difference),
+                "definitive_debit_difference": amount_text(debit_difference),
+                "definitive_credit_difference": amount_text(credit_difference),
+                "status": status,
+                "source_lines": [],
+                "target_lines": [],
+            }
+        )
+
+    history_start = date.fromisoformat(profile.get("history_start", "1900-01-01"))
+    cumulative_available = date_from <= history_start
+    source_cumulative = source_totals if cumulative_available else None
+    target_cumulative = target_totals if cumulative_available else None
+    cumulative: dict[str, dict[str, str]] = {}
+    if source_cumulative is not None and target_cumulative is not None:
+        for source_code, (debit, credit) in source_cumulative.items():
+            mapped = account_mapping.get(source_code)
+            if not mapped:
+                continue
+            target_code = mapped[0]
+            values = cumulative.setdefault(
+                target_code,
+                {"source_debit": "0.00", "source_credit": "0.00", "target_debit": "0.00", "target_credit": "0.00"},
+            )
+            values["source_debit"] = amount_text(Decimal(values["source_debit"]) + debit)
+            values["source_credit"] = amount_text(Decimal(values["source_credit"]) + credit)
+        for code, (debit, credit) in target_cumulative.items():
+            values = cumulative.setdefault(
+                code,
+                {"source_debit": "0.00", "source_credit": "0.00", "target_debit": "0.00", "target_credit": "0.00"},
+            )
+            values["target_debit"] = amount_text(debit)
+            values["target_credit"] = amount_text(credit)
+
+    historical_comparison: dict[str, dict[str, str]] = {}
+    if comparison_date_to:
+        if comparison_date_to == date_to:
+            historical_comparison = {
+                row["account_code"]: {
+                    "source_debit": row["source_debit"],
+                    "source_credit": row["source_credit"],
+                    "target_debit": row["target_debit"],
+                    "target_credit": row["target_credit"],
+                }
+                for row in rows
+            }
+        elif comparison_date_to < date_to:
+            overlap_source = source.period_totals(
+                int(profile["source"]["company_id"]), date_from, comparison_date_to, state_filter
+            )
+            overlap_target, _overlap_synced = target.period_totals(
+                int(profile["target"]["company_id"]), date_from, comparison_date_to, state_filter
+            )
+            overlap_by_target: dict[str, dict[str, Decimal]] = defaultdict(
+                lambda: {"debit": Decimal("0.00"), "credit": Decimal("0.00")}
+            )
+            for source_code, (debit, credit) in overlap_source.items():
+                mapping = account_mapping.get(source_code)
+                if mapping:
+                    overlap_by_target[mapping[0]]["debit"] += debit
+                    overlap_by_target[mapping[0]]["credit"] += credit
+            for code in sorted(set(overlap_by_target) | set(overlap_target)):
+                source_amounts = overlap_by_target.get(
+                    code, {"debit": Decimal("0.00"), "credit": Decimal("0.00")}
+                )
+                target_amounts = overlap_target.get(
+                    code, (Decimal("0.00"), Decimal("0.00"))
+                )
+                historical_comparison[code] = {
+                    "source_debit": amount_text(source_amounts["debit"]),
+                    "source_credit": amount_text(source_amounts["credit"]),
+                    "target_debit": amount_text(target_amounts[0]),
+                    "target_credit": amount_text(target_amounts[1]),
+                }
+
+    sync_operations = source.sync_operations(
+        int(profile["source"]["company_id"]), date_from, date_to, state_filter
+    )
+    payment_operations_method = getattr(source, "payment_operations", None)
+    payment_operations = payment_operations_method(int(profile["source"]["company_id"])) if payment_operations_method else []
+    payment_operations = [
+        operation for operation in payment_operations
+        if not operation.get("date") or date_from.isoformat() <= operation["date"] <= date_to.isoformat()
+    ]
+    operations = sync_operations + payment_operations
+    candidates = {
+        (str(operation["source_model"]), int(operation["source_id"]))
+        for operation in operations
+        if operation.get("source_model") and operation.get("source_id") is not None
+    }
+    origins = target.origins(int(profile["target"]["company_id"]), candidates)
+    operation_groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for operation in operations:
+        model = str(operation["source_model"])
+        source_id = int(operation["source_id"])
+        if operation.get("sync_classification") == "excluded":
+            reason = str(operation.get("reason") or "No enabled synchronization route applies.")
+            group_key = str(operation.get("journal") or "")
+            operation_groups[("excluded_operation", model, group_key, reason)].append(operation)
+            continue
+        matches = [
+            item for item in origins.get((model, source_id), [])
+            if item.get("posted", True)
+        ]
+        if not matches:
+            group_key = str(operation.get("journal") or operation.get("payment_mode") or "")
+            operation_groups[("pending_sync", model, group_key, "")].append(operation)
+        elif operation.get("date") and not any(
+            item.get("date") == operation["date"] for item in matches
+        ):
+            group_key = str(operation.get("journal") or operation.get("payment_mode") or "")
+            operation_groups[("temporal_operation", model, group_key, "")].append(
+                {**operation, "target_records": matches}
+            )
+    for (issue_type, model, group_key, reason), grouped_operations in operation_groups.items():
+        label = group_key or "unspecified journal/payment mode"
+        if issue_type == "excluded_operation":
+            title = f"{len(grouped_operations)} {model} operation(s) excluded in {label}: {reason}"
+        elif issue_type == "pending_sync":
+            title = f"{len(grouped_operations)} {model} operation(s) have no posted Odoo origin in {label}."
+        else:
+            title = f"{len(grouped_operations)} {model} operation(s) have different accounting dates in {label}."
+        issues.append({
+            "type": issue_type,
+            "source_model": model,
+            "title": title,
+            "details": {
+                "group_key": group_key,
+                "journal_or_payment_mode": label,
+                "reason": reason,
+                "operation_count": len(grouped_operations),
+                "sample_operations": grouped_operations[:100],
+            },
+        })
+
+    mapping_issue_types = {"unmapped_account", "missing_target_account", "ambiguous_mapping"}
+    return {
+        "company": {"key": profile["key"], "name": profile["name"]},
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "state_filter": state_filter,
+        "scope": scope,
+        "currency": "EUR",
+        "comparison_basis": "period_movement",
+        "details_mode": "live",
+        "aggregate_schema": "aggregate-v1",
+        "historical_comparison": historical_comparison,
+        "pending_adjustment_available": False,
+        "cumulative_scope": "company",
+        "cumulative_status": "informational_opening_unvalidated",
+        "cumulative_data_available": source_cumulative is not None and target_cumulative is not None,
+        "cumulative_warning": "Company cumulative balances are informational until opening entries are loaded and validated in Odoo; they are shown independently of the selected movement perimeter.",
+        "scope_warning": "Pending operations are listed separately; their AML amounts are not allocated into the account totals in aggregate mode. Differences remain temporal until the close threshold." if operations else "",
+        "cumulative_available": cumulative,
+        "accounts": rows,
+        "issues": issues,
+        "totals": {
+            "account_count": len(rows),
+            "issue_count": len(issues),
+            "mapping_complete": not any(issue["type"] in mapping_issue_types for issue in issues),
+            "mapping_issue_count": sum(issue["type"] in mapping_issue_types for issue in issues),
+            "source_debit": amount_text(sum((Decimal(row["source_debit"]) for row in rows), Decimal("0"))),
+            "source_credit": amount_text(sum((Decimal(row["source_credit"]) for row in rows), Decimal("0"))),
+            "target_debit": amount_text(sum((Decimal(row["target_debit"]) for row in rows), Decimal("0"))),
+            "target_credit": amount_text(sum((Decimal(row["target_credit"]) for row in rows), Decimal("0"))),
+        },
+    }
+
+
+def _build_aggregate_report_legacy(
+    profile: dict[str, Any],
+    date_from: date,
+    date_to: date,
+    state_filter: str,
+    scope: str,
+    source: Any,
+    target: Any,
+    source_accounts: list[dict[str, Any]],
+    target_accounts: list[dict[str, Any]],
+    account_mapping: dict[str, tuple[str, str]],
+    issues: list[dict[str, Any]],
+    comparison_date_to: date | None = None,
+) -> dict[str, Any]:
+    """Deprecated aggregate implementation retained during the query migration."""
+    source_totals = source.period_totals(
+        int(profile["source"]["company_id"]), date_from, date_to, state_filter
+    )
+    target_totals, target_synced = target.period_totals(
+        int(profile["target"]["company_id"]), date_from, date_to, state_filter
+    )
+    source_by_target: dict[str, dict[str, Decimal]] = defaultdict(
+        lambda: {"debit": Decimal("0.00"), "credit": Decimal("0.00")}
+    )
+    source_codes_by_target: dict[str, set[str]] = defaultdict(set)
+    for source_code, (debit, credit) in source_totals.items():
+        mapped = account_mapping.get(source_code)
+        if not mapped:
+            continue
+        target_code, _target_name = mapped
+        source_by_target[target_code]["debit"] += debit
+        source_by_target[target_code]["credit"] += credit
+        source_codes_by_target[target_code].add(source_code)
+
+    target_names = {
+        str(account.get("code_store") or account.get("code") or ""): str(account.get("name") or "")
+        for account in target_accounts
+    }
+    codes = sorted(set(source_by_target) | set(target_totals) | set(account_mapping[code][0] for code in account_mapping))
+    aging_cutoff = _next_month_close(date_to)
+    today = datetime.now(ZoneInfo("Europe/Madrid")).date()
+    rows = []
+    for code in codes:
+        source_values = source_by_target.get(code, {"debit": Decimal("0.00"), "credit": Decimal("0.00")})
+        actual = target_totals.get(code, (Decimal("0.00"), Decimal("0.00")))
+        synced = target_synced.get(code, (Decimal("0.00"), Decimal("0.00")))
+        native = (actual[0] - synced[0], actual[1] - synced[1])
+        debit_difference = source_values["debit"] - actual[0]
+        credit_difference = source_values["credit"] - actual[1]
+        balance_difference = (source_values["debit"] - source_values["credit"]) - (actual[0] - actual[1])
+        issue_type = None
+        if debit_difference or credit_difference:
+            issue_type = "movement_difference" if today > aging_cutoff else "temporal_difference"
+            issues.append({
+                "type": issue_type,
+                "account_code": code,
+                "title": f"Movement difference on Odoo account {code}.",
+                "details": {
+                    "date_from": date_from.isoformat(),
+                    "date_to": date_to.isoformat(),
+                    "ageing_cutoff": aging_cutoff.isoformat(),
+                    "scope": scope,
+                    "debit_difference": amount_text(debit_difference),
+                    "credit_difference": amount_text(credit_difference),
+                    "balance_difference": amount_text(balance_difference),
+                },
+            })
+        rows.append({
+            "account_code": code,
+            "account_name": target_names.get(code, ""),
+            "source_account_codes": sorted(source_codes_by_target.get(code, set())),
+            "source_debit": amount_text(source_values["debit"]),
+            "source_credit": amount_text(source_values["credit"]),
+            "pending_debit": "0.00",
+            "pending_credit": "0.00",
+            "target_synced_debit": amount_text(synced[0]),
+            "target_synced_credit": amount_text(synced[1]),
+            "target_native_debit": amount_text(native[0]),
+            "target_native_credit": amount_text(native[1]),
+            "target_debit": amount_text(actual[0]),
+            "target_credit": amount_text(actual[1]),
+            "debit_difference": amount_text(debit_difference),
+            "credit_difference": amount_text(credit_difference),
+            "balance_difference": amount_text(balance_difference),
+            "definitive_balance_difference": amount_text(balance_difference),
+            "definitive_debit_difference": amount_text(debit_difference),
+            "definitive_credit_difference": amount_text(credit_difference),
+            "status": issue_type or "balanced",
+            "source_lines": [],
+            "target_lines": [],
+        })
+
+    history_start = date.fromisoformat(profile.get("history_start", "1900-01-01"))
+    cumulative_available = date_from <= history_start
+    source_cumulative = source_totals if cumulative_available else None
+    target_cumulative = target_totals if cumulative_available else None
+    cumulative: dict[str, dict[str, str]] = {}
+    if source_cumulative is not None and target_cumulative is not None:
+        for source_code, (debit, credit) in source_cumulative.items():
+            mapped = account_mapping.get(source_code)
+            if not mapped:
+                continue
+            target_code, _name = mapped
+            row = cumulative.setdefault(target_code, {
+                "source_debit": "0.00", "source_credit": "0.00",
+                "target_debit": "0.00", "target_credit": "0.00",
+            })
+            row["source_debit"] = amount_text(Decimal(row["source_debit"]) + debit)
+            row["source_credit"] = amount_text(Decimal(row["source_credit"]) + credit)
+        for code, (debit, credit) in target_cumulative.items():
+            row = cumulative.setdefault(code, {
+                "source_debit": "0.00", "source_credit": "0.00",
+                "target_debit": "0.00", "target_credit": "0.00",
+            })
+            row["target_debit"] = amount_text(debit)
+            row["target_credit"] = amount_text(credit)
+
+    historical_comparison: dict[str, dict[str, str]] = {}
+    if comparison_date_to:
+        if comparison_date_to == date_to:
+            historical_comparison = {
+                row["account_code"]: {
+                    "source_debit": row["source_debit"],
+                    "source_credit": row["source_credit"],
+                    "target_debit": row["target_debit"],
+                    "target_credit": row["target_credit"],
+                }
+                for row in rows
+            }
+        elif comparison_date_to < date_to:
+            overlap_source = source.period_totals(
+                int(profile["source"]["company_id"]), date_from, comparison_date_to, state_filter
+            )
+            overlap_target, _overlap_synced = target.period_totals(
+                int(profile["target"]["company_id"]), date_from, comparison_date_to, state_filter
+            )
+            overlap_by_target: dict[str, dict[str, Decimal]] = defaultdict(
+                lambda: {"debit": Decimal("0.00"), "credit": Decimal("0.00")}
+            )
+            for source_code, (debit, credit) in overlap_source.items():
+                mapping = account_mapping.get(source_code)
+                if mapping:
+                    overlap_by_target[mapping[0]]["debit"] += debit
+                    overlap_by_target[mapping[0]]["credit"] += credit
+            for code in sorted(set(overlap_by_target) | set(overlap_target)):
+                source_amounts = overlap_by_target.get(
+                    code, {"debit": Decimal("0.00"), "credit": Decimal("0.00")}
+                )
+                target_amounts = overlap_target.get(
+                    code, (Decimal("0.00"), Decimal("0.00"))
+                )
+                historical_comparison[code] = {
+                    "source_debit": amount_text(source_amounts["debit"]),
+                    "source_credit": amount_text(source_amounts["credit"]),
+                    "target_debit": amount_text(target_amounts[0]),
+                    "target_credit": amount_text(target_amounts[1]),
+                }
+
+    sync_operations = source.sync_operations(
+        int(profile["source"]["company_id"]), date_from, date_to, state_filter
+    )
+    payment_operations = source.payment_operations(int(profile["source"]["company_id"]))
+    operations = [
+        *sync_operations,
+        *[
+            operation for operation in payment_operations
+            if not operation.get("date") or date_from.isoformat() <= operation["date"] <= date_to.isoformat()
+        ],
+    ]
+    candidates = {
+        (str(operation["source_model"]), int(operation["source_id"]))
+        for operation in operations
+        if operation.get("source_model") and operation.get("source_id") is not None
+    }
+    origins = target.origins(int(profile["target"]["company_id"]), candidates)
+    operation_groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for operation in operations:
+        model = str(operation["source_model"])
+        source_id = int(operation["source_id"])
+        classification = operation.get("sync_classification", "payment")
+        if classification == "excluded":
+            reason = str(operation.get("reason") or "No enabled synchronization route applies.")
+            operation_groups[("excluded_operation", model, str(operation.get("journal") or ""), reason)].append(operation)
+            continue
+        matches = [item for item in origins.get((model, source_id), []) if item.get("posted", True)]
+        if not matches:
+            operation_groups[("pending_sync", model, str(operation.get("journal") or operation.get("payment_mode") or ""), "")].append(operation)
+        elif operation.get("date") and not any(item.get("date") == operation["date"] for item in matches):
+            operation_groups[("temporal_operation", model, str(operation.get("journal") or operation.get("payment_mode") or ""), "")].append({**operation, "target_records": matches})
+    for (issue_type, model, journal_or_mode, reason), grouped_operations in operation_groups.items():
+        label = journal_or_mode or "unspecified journal/payment mode"
+        if issue_type == "excluded_operation":
+            title = f"{len(grouped_operations)} {model} operation(s) excluded in {label}: {reason}"
+        elif issue_type == "pending_sync":
+            title = f"{len(grouped_operations)} {model} operation(s) have no posted Odoo origin in {label}."
+        else:
+            title = f"{len(grouped_operations)} {model} operation(s) have different accounting dates in {label}."
+        issues.append({
+            "type": issue_type,
+            "source_model": model,
+            "title": title,
+            "details": {
+                "group_key": journal_or_mode,
+                "journal_or_payment_mode": label,
+                "reason": reason,
+                "operation_count": len(grouped_operations),
+                "operations": grouped_operations,
+            },
+        })
+
+    mapping_issue_types = {"unmapped_account", "missing_target_account", "ambiguous_mapping"}
+    return {
+        "company": {"key": profile["key"], "name": profile["name"]},
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "state_filter": state_filter,
+        "scope": scope,
+        "currency": "EUR",
+        "comparison_basis": "period_movement",
+        "details_mode": "live",
+        "aggregate_schema": "aggregate-v1",
+        "historical_comparison": historical_comparison,
+        "pending_adjustment_available": False,
+        "cumulative_scope": "company",
+        "cumulative_status": "informational_opening_unvalidated",
+        "cumulative_data_available": source_cumulative is not None and target_cumulative is not None,
+        "cumulative_warning": "Company cumulative balances are informational until opening entries are loaded and validated in Odoo; they are shown independently of the selected movement perimeter.",
+        "scope_warning": "Some period differences cannot be allocated to a single pending operation without line-level source identity." if scope == "synced" else "",
+        "cumulative_available": cumulative,
+        "accounts": rows,
+        "issues": issues,
+        "totals": {
+            "account_count": len(rows),
+            "issue_count": len(issues),
+            "mapping_complete": not any(issue["type"] in mapping_issue_types for issue in issues),
+            "mapping_issue_count": sum(issue["type"] in mapping_issue_types for issue in issues),
+            "source_debit": amount_text(sum((Decimal(row["source_debit"]) for row in rows), Decimal("0"))),
+            "source_credit": amount_text(sum((Decimal(row["source_credit"]) for row in rows), Decimal("0"))),
+            "target_debit": amount_text(sum((Decimal(row["target_debit"]) for row in rows), Decimal("0"))),
+            "target_credit": amount_text(sum((Decimal(row["target_credit"]) for row in rows), Decimal("0"))),
+        },
+    }
+
+
 def build_report(
     profile: dict[str, Any],
     date_from: date,
@@ -61,6 +567,7 @@ def build_report(
     scope: str,
     *,
     reader_factory: Callable[[dict[str, Any]], Any] = make_reader,
+    comparison_date_to: date | None = None,
 ) -> dict[str, Any]:
     if date_from > date_to:
         raise ValueError("Start date must not be after end date.")
@@ -123,6 +630,25 @@ def build_report(
             )
             continue
         account_mapping[source_code] = (target_code, str(target_account.get("name") or ""))
+
+    if scope == "company" and state_filter == "posted":
+        source_period_totals = getattr(source, "period_totals", None)
+        target_period_totals = getattr(target, "period_totals", None)
+        if source_period_totals and target_period_totals:
+            return _build_aggregate_report(
+                profile,
+                date_from,
+                date_to,
+                state_filter,
+                scope,
+                source,
+                target,
+                source_accounts,
+                target_accounts,
+                account_mapping,
+                issues,
+                comparison_date_to,
+            )
 
     source_lines = source.journal_items(
         source_company_id, date_from, date_to, state_filter

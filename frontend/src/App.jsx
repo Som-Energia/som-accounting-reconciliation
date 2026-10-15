@@ -284,7 +284,7 @@ export default function App() {
               </table>
               {accountRows.length === 0 && <p className="empty-state">No accounts match this filter.</p>}
             </div>
-            <p className="table-footnote">Odoo debit and credit include the company-native portion shown separately in each account detail. Pending source operations are removed from the definitive difference. Closing balances are not comparable until opening entries are validated.</p>
+            <p className="table-footnote">Odoo debit and credit include the company-native portion shown separately in each account detail. {run.pending_adjustment_available === false ? "Pending operations are listed separately; their AML amounts are not offset in aggregate mode, so differences remain temporal until close." : "Pending source operations are removed from the definitive difference."} Closing balances are not comparable until opening entries are validated. Account drill-down reads current ledger details on demand.</p>
           </section>
 
           <IssuePanel issues={run.issues || []} onReview={updateIssue} />

@@ -195,6 +195,25 @@ def get_run(database: str, run_id: str) -> dict[str, Any] | None:
     return json.loads(row["report_json"]) if row else None
 
 
+def previous_snapshot_date_to(
+    database: str,
+    company_key: str,
+    date_from: str,
+    date_to: str,
+    state_filter: str,
+    scope: str,
+) -> str | None:
+    with connect(database) as connection:
+        row = connection.execute(
+            """SELECT date_to FROM reconciliation_run
+            WHERE company_key = ? AND date_from = ? AND date_to <= ?
+                AND state_filter = ? AND scope = ?
+            ORDER BY date_to DESC, created_at DESC LIMIT 1""",
+            (company_key, date_from, date_to, state_filter, scope),
+        ).fetchone()
+    return row["date_to"] if row else None
+
+
 def list_items(
     database: str,
     run_id: str,
@@ -228,7 +247,7 @@ def previous_comparable_run(
     """Return the latest earlier snapshot with the same company/window start/scope/state."""
     with connect(database) as connection:
         run = connection.execute(
-            """SELECT id, date_to FROM reconciliation_run
+            """SELECT id, date_to, report_json FROM reconciliation_run
             WHERE company_key = ? AND date_from = ? AND date_to <= ?
                 AND state_filter = ? AND scope = ?
             ORDER BY date_to DESC, created_at DESC LIMIT 1""",
@@ -263,6 +282,41 @@ def detect_retroactive_changes(
         return []
     previous_run, previous_items = previous
     previous_end = previous_run["date_to"]
+    previous_report = json.loads(previous_run["report_json"])
+    if (
+        report.get("details_mode") == "live"
+        and report.get("aggregate_schema") == "aggregate-v1"
+        and previous_report.get("aggregate_schema") == "aggregate-v1"
+    ):
+        old_rows = {row["account_code"]: row for row in previous_report.get("accounts", [])}
+        overlap_rows = report.get("historical_comparison", {})
+        aggregate_changes = []
+        for account_code in sorted(set(old_rows) | set(overlap_rows)):
+            old = old_rows.get(account_code, {})
+            new = overlap_rows.get(account_code, {})
+            changed_systems = {}
+            for system, fields in (
+                ("source", ("source_debit", "source_credit")),
+                ("target", ("target_debit", "target_credit")),
+            ):
+                before = {field: old.get(field, "0.00") for field in fields}
+                after = {field: new.get(field, "0.00") for field in fields}
+                if before != after:
+                    changed_systems[system] = {"previous": before, "current": after}
+            if changed_systems:
+                aggregate_changes.append(
+                    {
+                        "type": "retroactive_change",
+                        "account_code": account_code,
+                        "title": f"Account {account_code} historical period totals changed after the previous snapshot.",
+                        "details": {
+                            "systems": changed_systems,
+                            "previous_snapshot_date_to": previous_end,
+                        },
+                    }
+                )
+        return aggregate_changes
+
     current_items: dict[tuple[str, int], dict[str, Any]] = {}
     for account in report.get("accounts", []):
         for field in ("source_lines", "target_lines"):
@@ -398,7 +452,12 @@ def _issue_fingerprint(company_key: str, issue: dict[str, Any]) -> str:
     if issue_type == "retroactive_change":
         identity.update({"system": details.get("system"), "line_id": details.get("line_id")})
     elif issue_type == "excluded_operation":
-        identity.update({"journal": details.get("journal"), "reason": details.get("reason")})
+        identity.update({
+            "journal": details.get("journal_or_payment_mode") or details.get("journal"),
+            "reason": details.get("reason"),
+        })
+    elif issue_type in {"pending_sync", "temporal_operation"} and issue.get("source_id") is None:
+        identity.update({"group_key": details.get("group_key"), "reason": details.get("reason")})
     elif issue_type == "ambiguous_origin":
         identity["target_models"] = details.get("target_models")
     elif issue_type in {"temporal_difference", "movement_difference"}:

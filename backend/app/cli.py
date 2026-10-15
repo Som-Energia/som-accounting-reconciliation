@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .profiles import load_profiles
 from .reconciliation import build_report
-from .storage import detect_retroactive_changes, initialize, purge_expired, save_run
+from .storage import detect_retroactive_changes, initialize, previous_snapshot_date_to, purge_expired, save_run
 
 
 def _subtract_months(value: date, months: int) -> date:
@@ -56,7 +56,22 @@ def main() -> None:
                 date_from = _subtract_months(today, 3)
             else:
                 date_from = date.fromisoformat(profile.get("history_start", "1900-01-01"))
-            report = build_report(profile, date_from, date_to, "posted", "company")
+            previous = previous_snapshot_date_to(
+                database,
+                profile["key"],
+                date_from.isoformat(),
+                date_to.isoformat(),
+                "posted",
+                "company",
+            )
+            report = build_report(
+                profile,
+                date_from,
+                date_to,
+                "posted",
+                "company",
+                comparison_date_to=date.fromisoformat(previous) if previous else None,
+            )
             report["issues"].extend(detect_retroactive_changes(database, report))
             report["totals"]["issue_count"] = len(report["issues"])
             saved = save_run(database, report)
@@ -68,12 +83,21 @@ def main() -> None:
     profile = next((item for item in profiles if item["key"] == args.company), None)
     if profile is None:
         raise SystemExit(f"Unknown company profile: {args.company}")
+    previous = previous_snapshot_date_to(
+        database,
+        profile["key"],
+        args.date_from,
+        args.date_to,
+        args.state,
+        args.scope,
+    )
     report = build_report(
         profile,
         date.fromisoformat(args.date_from),
         date.fromisoformat(args.date_to),
         args.state,
         args.scope,
+        comparison_date_to=date.fromisoformat(previous) if previous else None,
     )
     report["issues"].extend(detect_retroactive_changes(database, report))
     report["totals"]["issue_count"] = len(report["issues"])

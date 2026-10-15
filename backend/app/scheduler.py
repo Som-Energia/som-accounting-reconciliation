@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .profiles import load_profiles
 from .reconciliation import build_report
-from .storage import claim_schedule, detect_retroactive_changes, finish_schedule, initialize, purge_expired, save_run
+from .storage import claim_schedule, detect_retroactive_changes, finish_schedule, initialize, previous_snapshot_date_to, purge_expired, save_run
 
 
 LOGGER = logging.getLogger("accounting_reconciliation.scheduler")
@@ -40,7 +40,22 @@ def execute_scheduled(kind: str, today: date) -> None:
                 if kind == "nightly"
                 else date.fromisoformat(profile.get("history_start", "1900-01-01"))
             )
-            report = build_report(profile, date_from, date_to, "posted", "company")
+            previous = previous_snapshot_date_to(
+                DATABASE,
+                profile["key"],
+                date_from.isoformat(),
+                date_to.isoformat(),
+                "posted",
+                "company",
+            )
+            report = build_report(
+                profile,
+                date_from,
+                date_to,
+                "posted",
+                "company",
+                comparison_date_to=date.fromisoformat(previous) if previous else None,
+            )
             report["issues"].extend(detect_retroactive_changes(DATABASE, report))
             report["totals"]["issue_count"] = len(report["issues"])
             saved = save_run(DATABASE, report)
