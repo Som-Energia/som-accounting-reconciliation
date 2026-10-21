@@ -63,6 +63,19 @@ The Docker Compose stack expects:
 - `COMPANIES_CONFIG_FILE`, `OPENERP_PASSWORD_FILE`, `ODOO_API_KEY_FILE`, and `WEB_AUTH_FILE` pointing to protected runtime files. The `WEB_AUTH_FILE` is an Nginx `htpasswd` file; no password or credential belongs in the repository.
 - `BACKEND_IMAGE` and `FRONTEND_IMAGE` for deployment image references.
 
+## Publish images to Harbor
+
+From a clean checkout with Docker running, log in to Harbor and run the publisher with a new image tag:
+
+```bash
+docker login harbor.somenergia.coop
+scripts/publish-images.sh 0.1.1
+```
+
+The script builds both images before pushing either one. It publishes the supplied tag and `latest` for the backend and frontend in the `saldos_odoo` Harbor project. Choose a new tag for each release; the script does not create or push a Git tag, or redeploy the Portainer stack.
+
+Set `BACKEND_IMAGE` and `FRONTEND_IMAGE` in Portainer to the versioned image references printed by the script, then update the stack. The repository paths can be overridden with `BACKEND_IMAGE_REPOSITORY` and `FRONTEND_IMAGE_REPOSITORY` if the Harbor repository names change.
+
 Create the shared web password file interactively on a protected host, then mount it as `WEB_AUTH_FILE`:
 
 ```bash
