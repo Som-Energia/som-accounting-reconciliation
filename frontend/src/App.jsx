@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
+import packageJson from "../package.json";
 import { netBalance } from "./amounts.js";
 import { filterJournalItems, ledgerUrl } from "./ledger.js";
 
+const appVersion = packageJson.version;
 const today = new Date();
 const dateValue = (date) => {
   const year = date.getFullYear();
@@ -348,7 +350,7 @@ function ReconciliationDashboard() {
 
           <IssuePanel issues={run.issues || []} onReview={updateIssue} />
         </>}
-        <footer>Read-only ledger access · snapshots retained for two years · all amounts in EUR · <a className="source-link" href="https://github.com/Som-Energia/som-accounting-reconciliation">Source code</a></footer>
+        <footer>Read-only ledger access · snapshots retained for two years · all amounts in EUR · Version {appVersion} · <a className="source-link" href="https://github.com/Som-Energia/som-accounting-reconciliation">Source code</a></footer>
       </div>
     </main>
   );
@@ -408,7 +410,7 @@ function LedgerPage() {
         {error && <div role="alert" className="error-banner">{error}</div>}
         {!loading && !error && !account && <div role="alert" className="error-banner">Account not found in this reconciliation.</div>}
         {account && <section className="panel ledger-page-panel"><LedgerDetails account={account} runId={runId} /></section>}
-        <footer><a className="source-link" href="/">Back to reconciliation</a> · Read-only ledger access · all amounts in EUR</footer>
+        <footer><a className="source-link" href="/">Back to reconciliation</a> · Read-only ledger access · all amounts in EUR · Version {appVersion}</footer>
       </div>
     </main>
   );
