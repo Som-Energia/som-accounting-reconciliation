@@ -86,7 +86,7 @@ function LedgerDetails({ account, runId }) {
   return (
     <>
       {data.matched_count > 0 && <div className="details-match-toolbar">
-        <span>{showMatched ? `Showing ${data.matched_count} matching movement pair(s).` : `${data.matched_count} matching movement pair(s) hidden.`}</span>
+        <span>{showMatched ? `Showing ${data.matched_count} matching movement group(s).` : `${data.matched_count} matching movement group(s) hidden.`}</span>
         <button type="button" className="matched-toggle" disabled={loading} onClick={toggleMatched}>
           {loading ? "Loading…" : showMatched ? "Hide matching movements" : `Show matching movements (${data.matched_count})`}
         </button>
