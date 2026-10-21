@@ -626,7 +626,7 @@ class OpenERPReader:
         line_fields = self.client.fields("account.move.line")
         wanted = (
             "id", "move_id", "account_id", "date", "debit", "credit", "name", "ref",
-            "journal_id",
+            "journal_id", "partner_id",
         )
         fields = [name for name in wanted if name in line_fields]
         raw_lines = []
@@ -736,6 +736,7 @@ class OpenERPReader:
                     date=date.fromisoformat(str(row["date"])[:10]),
                     debit=decimal_amount(row.get("debit")),
                     credit=decimal_amount(row.get("credit")),
+                    partner_id=_relation_id(row.get("partner_id")),
                     journal=str(journal.get("name") or journal.get("code") or ""),
                     move_label=str(move.get("name") or ""),
                     description=str(row.get("ref") or row.get("name") or ""),
@@ -874,7 +875,7 @@ class OdooReader:
         fields = self.client.fields("account.move.line")
         wanted = (
             "id", "move_id", "account_id", "date", "debit", "credit", "name", "ref",
-            "journal_id", "parent_state",
+            "journal_id", "parent_state", "partner_id",
         )
         requested = [name for name in wanted if name in fields]
         domain = [
@@ -958,6 +959,7 @@ class OdooReader:
                     date=date.fromisoformat(str(row["date"])[:10]),
                     debit=decimal_amount(row.get("debit")),
                     credit=decimal_amount(row.get("credit")),
+                    partner_id=_relation_id(row.get("partner_id")),
                     journal=str(journal.get("name") or journal.get("code") or ""),
                     move_label=str(move.get("name") or ""),
                     description=str(row.get("ref") or row.get("name") or ""),
