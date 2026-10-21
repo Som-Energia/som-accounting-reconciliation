@@ -141,11 +141,15 @@ input:focus, select:focus, textarea:focus { border-color: #168165; box-shadow: 0
 .details-row td { padding: 0 !important; background: #f7faf8; }
 .details-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding: 20px; }
 .details-grid h3 { margin: 0 0 12px; color: #315347; font: 700 12px Manrope, sans-serif; }
+.details-match-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 20px 0; color: #637970; font-size: 11px; }
+.matched-toggle { padding: 8px 11px; border: 1px solid #cfe2da; border-radius: 7px; background: #f4faf7; color: #14745d; cursor: pointer; font: 700 11px "DM Sans", sans-serif; }
+.matched-toggle:disabled { cursor: wait; opacity: .65; }
 .detail-table-wrap { overflow: auto; border: 1px solid #e5ece8; border-radius: 7px; background: #fff; }
 .detail-table { width: 100%; min-width: 600px; border-collapse: collapse; }
-.detail-table th { padding: 9px; background: #f6f9f7; color: #74847d; font-size: 9px; text-align: left; text-transform: uppercase; }
-.detail-table td { padding: 9px; border-top: 1px solid #edf1ef; font-size: 10px; text-align: left; white-space: nowrap; }
+.detail-table th { padding: 12px 14px; background: #f6f9f7; color: #74847d; font-size: 9px; text-align: left; text-transform: uppercase; }
+.detail-table td { padding: 12px 14px; border-top: 1px solid #edf1ef; font-size: 10px; text-align: left; white-space: nowrap; }
 .detail-table td small { display: block; max-width: 220px; overflow: hidden; color: #8b9892; font-size: 9px; text-overflow: ellipsis; }
+.detail-table td .matched-indicator { color: #14745d; font-weight: 700; }
 .table-footnote { margin: 0; padding: 12px 22px 16px; color: #819089; font-size: 10px; }
 .empty-state, .muted { color: #8a9892; font-size: 11px; }
 .empty-state { padding: 12px 22px; }

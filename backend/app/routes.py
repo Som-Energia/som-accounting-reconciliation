@@ -7,6 +7,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from .connectors import ERPAuthenticationError, make_reader
 from .demo import demo_report
+from .item_matching import match_journal_items
 from .profiles import load_profiles, public_profiles
 from .reconciliation import _serialize_line, build_report
 from .storage import detect_retroactive_changes, get_run, list_issues, list_items, list_runs, previous_snapshot_date_to, review_issue, save_run
@@ -122,6 +123,106 @@ def run_issues(run_id: str) -> tuple:
     if get_run(current_app.config["DATABASE"], run_id) is None:
         return jsonify({"error": "Run not found."}), 404
     return jsonify({"issues": list_issues(current_app.config["DATABASE"], run_id)}), 200
+
+
+def _all_saved_items(run_id: str, account_code: str, system: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        page, total = list_items(
+            current_app.config["DATABASE"],
+            run_id,
+            account_code,
+            system,
+            offset=offset,
+            limit=500,
+        )
+        if not page:
+            return items
+        items.extend(page)
+        offset += len(page)
+        if offset >= total:
+            return items
+
+
+@api.get("/runs/<run_id>/accounts/<account_code>/items/comparison")
+def account_item_comparison(run_id: str, account_code: str) -> tuple:
+    report = get_run(current_app.config["DATABASE"], run_id)
+    if report is None:
+        return jsonify({"error": "Run not found."}), 404
+    account_row = next(
+        (item for item in report["accounts"] if item["account_code"] == account_code),
+        None,
+    )
+    if account_row is None:
+        return jsonify({"error": "Account not found in this run."}), 404
+
+    try:
+        source_items = _all_saved_items(run_id, account_code, "source")
+        target_items = _all_saved_items(run_id, account_code, "target")
+        if report.get("details_mode") == "live" and (not source_items or not target_items):
+            profile = next(
+                (item for item in _profiles() if item["key"] == report["company"]["key"]),
+                None,
+            )
+            if profile is not None and profile.get("source") and profile.get("target"):
+                date_from = date.fromisoformat(report["date_from"])
+                date_to = date.fromisoformat(report["date_to"])
+                if not source_items and account_row.get("source_account_codes"):
+                    source = make_reader(profile["source"])
+                    source_lines = source.journal_items(
+                        int(profile["source"]["company_id"]),
+                        date_from,
+                        date_to,
+                        report["state_filter"],
+                        account_codes=set(account_row["source_account_codes"]),
+                    )
+                    source_items = [
+                        {**_serialize_line(line), "mapped_account_code": account_code}
+                        for line in source_lines
+                    ]
+                if not target_items:
+                    target = make_reader(profile["target"])
+                    target_lines = target.journal_items(
+                        int(profile["target"]["company_id"]),
+                        date_from,
+                        date_to,
+                        report["state_filter"],
+                        account_codes={account_code},
+                    )
+                    target_items = [_serialize_line(line) for line in target_lines]
+
+        source_items, target_items, matched_count = match_journal_items(
+            source_items, target_items
+        )
+        include_matched = request.args.get("include_matched", "false").lower() in {
+            "1", "true", "yes",
+        }
+        if not include_matched:
+            source_items = [item for item in source_items if not item["matched"]]
+            target_items = [item for item in target_items if not item["matched"]]
+        source_total = len(source_items)
+        target_total = len(target_items)
+        return jsonify(
+            {
+                "source_items": source_items,
+                "target_items": target_items,
+                "source_total": source_total,
+                "target_total": target_total,
+                "matched_count": matched_count,
+            }
+        ), 200
+    except ERPAuthenticationError as error:
+        current_app.logger.warning(
+            "ERP authentication rejected system=%s endpoint=%s database=%s username=%s",
+            error.system,
+            error.endpoint,
+            error.database,
+            error.username,
+        )
+        return jsonify({"error": str(error)}), 400
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
 
 
 @api.get("/runs/<run_id>/accounts/<account_code>/items")
