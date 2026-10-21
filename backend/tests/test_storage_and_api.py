@@ -1,6 +1,11 @@
 from datetime import date
+import logging
+
+import pytest
 
 from app import create_app
+from app import routes
+from app.connectors import ERPAuthenticationError
 from app.demo import demo_report
 from app.storage import claim_schedule, detect_retroactive_changes, finish_schedule, get_run, initialize, list_issues, list_items, purge_expired, review_issue, save_run
 
@@ -83,6 +88,51 @@ def test_invalid_period_is_rejected(tmp_path):
         json={"company": "demo", "date_from": "2026-02-01", "date_to": "2026-01-01"},
     )
     assert response.status_code == 400
+
+
+@pytest.mark.parametrize("system", ["OpenERP", "Odoo"])
+def test_erp_authentication_failure_logs_provider_context_without_secrets(
+    system, tmp_path, monkeypatch, caplog
+):
+    profile = {
+        "key": "som-energia",
+        "name": "Som Energia SCCL",
+        "source": {},
+        "target": {
+            "url": "https://odoo.example.test/rpc?token=url-secret",
+            "database": "odoo_db",
+            "username": "reader",
+        },
+    }
+
+    def fail_report(*_args, **_kwargs):
+        raise ERPAuthenticationError(system, profile["target"])
+
+    monkeypatch.setattr(routes, "_profiles", lambda: [profile])
+    monkeypatch.setattr(routes, "build_report", fail_report)
+    caplog.set_level(logging.WARNING)
+    app = create_app({"TESTING": True, "DATABASE": str(tmp_path / "api.sqlite3")})
+
+    response = app.test_client().post(
+        "/api/runs",
+        json={
+            "company": "som-energia",
+            "date_from": "2026-01-01",
+            "date_to": "2026-01-31",
+            "state_filter": "posted",
+            "scope": "company",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json == {
+        "error": f"{system} authentication failed for the configured read-only user."
+    }
+    assert f"system={system}" in caplog.text
+    assert "endpoint=https://odoo.example.test" in caplog.text
+    assert "database=odoo_db" in caplog.text
+    assert "username=reader" in caplog.text
+    assert "url-secret" not in caplog.text
 
 
 def test_retroactive_journal_line_change_is_reported_against_previous_snapshot(tmp_path):

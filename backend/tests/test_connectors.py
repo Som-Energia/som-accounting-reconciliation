@@ -1,9 +1,18 @@
 import pytest
 from datetime import date
+import sys
+from types import ModuleType
 from types import SimpleNamespace
 
 import app.connectors as connectors
-from app.connectors import ErpPeekReaderClient, OdooReader, OdooXMLRPCReader, OpenERPReader, PAGE_SIZE
+from app.connectors import (
+    ERPAuthenticationError,
+    ErpPeekReaderClient,
+    OdooReader,
+    OdooXMLRPCReader,
+    OpenERPReader,
+    PAGE_SIZE,
+)
 
 
 class FakeErpPeekClient:
@@ -91,6 +100,38 @@ def test_openerp_connector_uses_erppeek_and_only_read_methods(monkeypatch):
     assert set(call[1] for call in factory.client.calls) <= {"fields", "search", "read"}
 
 
+def test_openerp_invalid_credentials_raise_provider_specific_error(monkeypatch):
+    class FakeErpPeekError(Exception):
+        pass
+
+    def reject_login(*_args, **_kwargs):
+        raise FakeErpPeekError("Invalid username or password")
+
+    fake_erppeek = ModuleType("erppeek")
+    fake_erppeek.Client = reject_login
+    fake_erppeek.Error = FakeErpPeekError
+    monkeypatch.setitem(sys.modules, "erppeek", fake_erppeek)
+    monkeypatch.setenv("OPENERP_SECRET_FILE", "/secret/openerp")
+    monkeypatch.setattr("app.connectors.Path.read_text", lambda *_args, **_kwargs: "secret-value")
+
+    with pytest.raises(ERPAuthenticationError) as error:
+        ErpPeekReaderClient(
+            {
+                "url": "https://openerp.example.test/xmlrpc?token=url-secret",
+                "database": "erp_db",
+                "username": "reader",
+                "password_file_env": "OPENERP_SECRET_FILE",
+            }
+        )
+
+    assert error.value.system == "OpenERP"
+    assert error.value.endpoint == "https://openerp.example.test"
+    assert error.value.database == "erp_db"
+    assert error.value.username == "reader"
+    assert "secret-value" not in str(error.value)
+    assert "url-secret" not in str(error.value)
+
+
 def test_odoo_connector_keeps_its_external_xmlrpc_endpoint(monkeypatch):
     monkeypatch.setenv("ODOO_SECRET", "test-only-secret")
     factory = OdooProxyFactory()
@@ -110,6 +151,37 @@ def test_odoo_connector_keeps_its_external_xmlrpc_endpoint(monkeypatch):
         "https://odoo.example.test/xmlrpc/2/object",
     ]
     assert set(factory.object.calls) == {"fields_get"}
+
+
+def test_odoo_invalid_credentials_raise_provider_specific_error(monkeypatch):
+    class RejectingCommon:
+        def authenticate(self, _database, _username, _password, _context):
+            return False
+
+    class RejectingProxyFactory:
+        def __call__(self, url):
+            return RejectingCommon() if url.endswith("common") else FakeOdooObjectProxy()
+
+    monkeypatch.setenv("ODOO_SECRET", "secret-value")
+
+    with pytest.raises(ERPAuthenticationError) as error:
+        OdooXMLRPCReader(
+            {
+                "url": "https://odoo.example.test/rpc?token=url-secret",
+                "database": "odoo_db",
+                "username": "reader",
+                "password_env": "ODOO_SECRET",
+                "protocol": "odoo18",
+            },
+            proxy_factory=RejectingProxyFactory(),
+        )
+
+    assert error.value.system == "Odoo"
+    assert error.value.endpoint == "https://odoo.example.test"
+    assert error.value.database == "odoo_db"
+    assert error.value.username == "reader"
+    assert "secret-value" not in str(error.value)
+    assert "url-secret" not in str(error.value)
 
 
 def test_connector_fails_closed_when_secret_is_missing(monkeypatch):

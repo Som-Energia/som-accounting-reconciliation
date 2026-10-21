@@ -5,7 +5,7 @@ from typing import Any
 
 from flask import Blueprint, current_app, jsonify, request
 
-from .connectors import make_reader
+from .connectors import ERPAuthenticationError, make_reader
 from .demo import demo_report
 from .profiles import load_profiles, public_profiles
 from .reconciliation import _serialize_line, build_report
@@ -78,6 +78,15 @@ def create_run() -> tuple:
         report["issues"].extend(detect_retroactive_changes(current_app.config["DATABASE"], report))
         report["totals"]["issue_count"] = len(report["issues"])
         return jsonify(save_run(current_app.config["DATABASE"], report)), 201
+    except ERPAuthenticationError as error:
+        current_app.logger.warning(
+            "ERP authentication rejected system=%s endpoint=%s database=%s username=%s",
+            error.system,
+            error.endpoint,
+            error.database,
+            error.username,
+        )
+        return jsonify({"error": str(error)}), 400
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
     except Exception:
