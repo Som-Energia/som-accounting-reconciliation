@@ -332,7 +332,7 @@ export default function App() {
 
           <IssuePanel issues={run.issues || []} onReview={updateIssue} />
         </>}
-        <footer>Read-only ledger access · snapshots retained for two years · all amounts in EUR</footer>
+        <footer>Read-only ledger access · snapshots retained for two years · all amounts in EUR · <a className="source-link" href="https://github.com/Som-Energia/som-accounting-reconciliation">Source code</a></footer>
       </div>
     </main>
   );

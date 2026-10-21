@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,7 @@ name = "som-accounting-reconciliation"
 version = "0.1.0"
 description = "Read-only OpenERP and Odoo accounting movement comparison"
 requires-python = ">=3.12"
+license = "AGPL-3.0-or-later"
 dependencies = ["Flask>=3.0,<4", "gunicorn>=23,<24", "erppeek==1.7.2"]
 
 [project.optional-dependencies]
