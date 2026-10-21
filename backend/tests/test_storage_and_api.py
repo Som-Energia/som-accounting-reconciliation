@@ -1,5 +1,7 @@
-from datetime import date
+import json
 import logging
+from datetime import date
+from decimal import Decimal
 
 import pytest
 
@@ -7,6 +9,7 @@ from app import create_app
 from app import routes
 from app.connectors import ERPAuthenticationError
 from app.demo import demo_report
+from app.domain import JournalItem
 from app.storage import claim_schedule, detect_retroactive_changes, finish_schedule, get_run, initialize, list_issues, list_items, purge_expired, review_issue, save_run
 
 
@@ -79,6 +82,140 @@ def test_demo_run_is_available_through_api_without_erp_credentials(tmp_path):
     assert detail.status_code == 200
     assert detail.json["total"] == 4
     assert len(detail.json["items"]) == 1
+
+
+def test_demo_account_comparison_hides_exact_matches_but_can_include_them(tmp_path):
+    app = create_app({"TESTING": True, "DATABASE": str(tmp_path / "comparison.sqlite3"), "DEMO_MODE": True})
+    client = app.test_client()
+    run_response = client.post(
+        "/api/runs",
+        json={
+            "company": "demo",
+            "date_from": "2026-01-01",
+            "date_to": "2026-01-31",
+            "state_filter": "posted",
+            "scope": "company",
+        },
+    )
+    run_id = run_response.json["id"]
+
+    response = client.get(f"/api/runs/{run_id}/accounts/430000/items/comparison")
+    assert response.status_code == 200
+    assert response.json["matched_count"] == 2
+    assert response.json["source_total"] == 2
+    assert response.json["target_total"] == 2
+    assert {item["line_id"] for item in response.json["source_items"]} == {2002, 3001}
+    assert {item["line_id"] for item in response.json["target_items"]} == {5021, 5030}
+
+    all_items = client.get(
+        f"/api/runs/{run_id}/accounts/430000/items/comparison?include_matched=true"
+    )
+    assert all_items.status_code == 200
+    assert all_items.json["source_total"] == 4
+    assert all_items.json["target_total"] == 4
+    assert {item["line_id"] for item in all_items.json["source_items"] if item["matched"]} == {1001, 1010}
+    assert {item["line_id"] for item in all_items.json["target_items"] if item["matched"]} == {5001, 5010}
+
+
+def test_live_account_comparison_loads_both_erp_ledgers(tmp_path, monkeypatch):
+    companies_config = tmp_path / "companies.json"
+    companies_config.write_text(
+        json.dumps(
+            {
+                "companies": [
+                    {
+                        "key": "example",
+                        "name": "Example",
+                        "source": {
+                            "url": "https://openerp.example.test",
+                            "database": "legacy",
+                            "company_id": 1,
+                            "username": "reader",
+                            "protocol": "openerp5",
+                        },
+                        "target": {
+                            "url": "https://odoo.example.test",
+                            "database": "modern",
+                            "company_id": 1,
+                            "username": "reader",
+                            "protocol": "odoo18",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def journal_item(system, line_id, *, model="account.invoice", source_id=7, native=False):
+        return JournalItem(
+            system=system,
+            line_id=line_id,
+            move_id=line_id + 100,
+            account_code="430000001" if system == "source" else "430000",
+            account_name="Receivables",
+            date=date(2026, 1, 15),
+            debit=Decimal("100.00"),
+            credit=Decimal("0.00"),
+            source_model=model,
+            source_id=source_id,
+            is_native=native,
+        )
+
+    source_lines = [journal_item("source", 1)]
+    target_lines = [
+        journal_item("target", 11),
+        journal_item("target", 12, model="", source_id=None, native=True),
+    ]
+
+    class Reader:
+        def __init__(self, lines):
+            self.lines = lines
+
+        def journal_items(self, *_args, **_kwargs):
+            return self.lines
+
+    monkeypatch.setattr(
+        routes,
+        "make_reader",
+        lambda config: Reader(source_lines if config["protocol"] == "openerp5" else target_lines),
+    )
+    app = create_app(
+        {
+            "TESTING": True,
+            "DATABASE": str(tmp_path / "live-comparison.sqlite3"),
+            "COMPANIES_CONFIG": str(companies_config),
+            "DEMO_MODE": False,
+        }
+    )
+    report = {
+        "company": {"key": "example", "name": "Example"},
+        "date_from": "2026-01-01",
+        "date_to": "2026-01-31",
+        "state_filter": "posted",
+        "scope": "company",
+        "details_mode": "live",
+        "accounts": [
+            {
+                "account_code": "430000",
+                "source_account_codes": ["430000001"],
+                "source_lines": [],
+                "target_lines": [],
+            }
+        ],
+        "issues": [],
+        "totals": {},
+    }
+    run = save_run(str(tmp_path / "live-comparison.sqlite3"), report)
+
+    response = app.test_client().get(
+        f"/api/runs/{run['id']}/accounts/430000/items/comparison"
+    )
+
+    assert response.status_code == 200
+    assert response.json["matched_count"] == 1
+    assert response.json["source_items"] == []
+    assert [item["line_id"] for item in response.json["target_items"]] == [12]
 
 
 def test_invalid_period_is_rejected(tmp_path):

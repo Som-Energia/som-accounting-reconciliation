@@ -29,56 +29,98 @@ async function request(path, options) {
 }
 
 function LedgerDetails({ account, runId }) {
+  const [comparison, setComparison] = useState(null);
+  const [completeComparison, setCompleteComparison] = useState(null);
+  const [showMatched, setShowMatched] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError("");
+    setComparison(null);
+    setCompleteComparison(null);
+    setShowMatched(false);
+    request(`/runs/${runId}/accounts/${encodeURIComponent(account.account_code)}/items/comparison`)
+      .then((result) => { if (active) setComparison(result); })
+      .catch((loadError) => { if (active) setError(loadError.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [runId, account.account_code]);
+
+  async function toggleMatched() {
+    if (showMatched) {
+      setShowMatched(false);
+      return;
+    }
+    if (completeComparison) {
+      setShowMatched(true);
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const result = await request(
+        `/runs/${runId}/accounts/${encodeURIComponent(account.account_code)}/items/comparison?include_matched=true`
+      );
+      setCompleteComparison(result);
+      setShowMatched(true);
+    } catch (loadError) {
+      setError(loadError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (loading && !comparison) return <p className="muted">Comparing OpenERP and Odoo movements…</p>;
+  if (error && !comparison) return <p className="error-inline">{error}</p>;
+  const data = showMatched ? completeComparison : comparison;
+  if (!data) return null;
+
   return (
-    <div className="details-grid">
-      <section>
-        <h3>OpenERP journal items</h3>
-        <JournalItems runId={runId} accountCode={account.account_code} system="source" />
-      </section>
-      <section>
-        <h3>Odoo journal items</h3>
-        <JournalItems runId={runId} accountCode={account.account_code} system="target" />
-      </section>
-    </div>
+    <>
+      {data.matched_count > 0 && <div className="details-match-toolbar">
+        <span>{showMatched ? `Showing ${data.matched_count} matching movement pair(s).` : `${data.matched_count} matching movement pair(s) hidden.`}</span>
+        <button type="button" className="matched-toggle" disabled={loading} onClick={toggleMatched}>
+          {loading ? "Loading…" : showMatched ? "Hide matching movements" : `Show matching movements (${data.matched_count})`}
+        </button>
+      </div>}
+      {error && <p className="error-inline">{error}</p>}
+      <div className="details-grid">
+        <section>
+          <h3>OpenERP journal items</h3>
+          <JournalItems lines={data.source_items} system="source" showMatched={showMatched} />
+        </section>
+        <section>
+          <h3>Odoo journal items</h3>
+          <JournalItems lines={data.target_items} system="target" showMatched={showMatched} />
+        </section>
+      </div>
+    </>
   );
 }
 
-function JournalItems({ runId, accountCode, system }) {
-  const [lines, setLines] = useState([]);
-  const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  async function load(offset = 0) {
-    setLoading(true);
-    try {
-      const query = new URLSearchParams({ system, offset: String(offset), limit: "100" });
-      const result = await request(`/runs/${runId}/accounts/${encodeURIComponent(accountCode)}/items?${query}`);
-      setLines((current) => offset ? [...current, ...result.items] : result.items);
-      setTotal(result.total);
-      setError("");
-    } catch (loadError) { setError(loadError.message); }
-    finally { setLoading(false); }
-  }
-  useEffect(() => { load(); }, [runId, accountCode, system]);
-  if (loading && !lines.length) return <p className="muted">Loading journal items…</p>;
-  if (error) return <p className="error-inline">{error}</p>;
-  if (!lines.length) return <p className="muted">No journal items in this period.</p>;
+function JournalItems({ lines, system, showMatched }) {
+  const [visibleCount, setVisibleCount] = useState(100);
+  const visibleLines = lines.slice(0, visibleCount);
+  if (!lines.length) return <p className="muted">{showMatched ? "No journal items in this period." : "No unmatched journal items in this period."}</p>;
   return (
     <>
     <div className="detail-table-wrap">
       <table className="detail-table">
         <thead><tr><th>Date</th><th>Journal</th><th>Entry</th><th>Origin</th><th>Debit</th><th>Credit</th></tr></thead>
-        <tbody>{lines.map((line) => (
+        <tbody>{visibleLines.map((line) => (
           <tr key={`${line.system}-${line.line_id}`}>
             <td>{line.date}</td><td>{line.journal || "—"}</td>
             <td><strong>{line.move_label || line.move_id}</strong><small>AML {line.line_id} · {line.description}</small></td>
-            <td>{line.source_model ? `${line.source_model} #${line.source_id}` : line.is_native ? "Odoo native" : "Unidentified"}{line.is_reversal ? <small>Reversal</small> : null}</td>
+            <td>{line.source_model ? `${line.source_model} #${line.source_id}` : line.is_native ? "Odoo native" : "Unidentified"}{line.is_reversal ? <small>Reversal</small> : null}{line.matched ? <small className="matched-indicator">Matches other ERP</small> : null}</td>
             <td>{money(line.debit)}</td><td>{money(line.credit)}</td>
           </tr>
         ))}</tbody>
       </table>
     </div>
-    {lines.length < total && <button className="load-more" disabled={loading} onClick={() => load(lines.length)}>{loading ? "Loading…" : `Load more (${lines.length} of ${total})`}</button>}
+    {visibleLines.length < lines.length && <button className="load-more" onClick={() => setVisibleCount((count) => count + 100)}>{`Load more (${visibleLines.length} of ${lines.length})`}</button>}
     </>
   );
 }
