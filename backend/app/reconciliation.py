@@ -22,6 +22,7 @@ def _serialize_line(line: JournalItem) -> dict[str, Any]:
         "date": line.date.isoformat(),
         "debit": amount_text(line.debit),
         "credit": amount_text(line.credit),
+        "partner_id": line.partner_id,
         "journal": line.journal,
         "move_label": line.move_label,
         "description": line.description,

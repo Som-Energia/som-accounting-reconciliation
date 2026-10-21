@@ -160,6 +160,7 @@ def test_live_account_comparison_loads_both_erp_ledgers(tmp_path, monkeypatch):
             source_model=model,
             source_id=source_id,
             is_native=native,
+            partner_id=42,
         )
 
     source_lines = [journal_item("source", 1)]
@@ -216,6 +217,7 @@ def test_live_account_comparison_loads_both_erp_ledgers(tmp_path, monkeypatch):
     assert response.json["matched_count"] == 1
     assert response.json["source_items"] == []
     assert [item["line_id"] for item in response.json["target_items"]] == [12]
+    assert response.json["target_items"][0]["partner_id"] == 42
 
 
 def test_invalid_period_is_rejected(tmp_path):

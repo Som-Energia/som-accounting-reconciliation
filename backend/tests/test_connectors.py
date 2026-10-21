@@ -288,6 +288,68 @@ def test_account_connectors_read_beyond_the_first_five_hundred_records():
     assert target_client.offsets == [0, PAGE_SIZE]
 
 
+@pytest.mark.parametrize("system", ["source", "target"])
+def test_journal_item_connectors_extract_partner_id(system):
+    class JournalItemClient:
+        def fields(self, model):
+            return {
+                "account.account": {"id", "code", "code_store", "name"},
+                "account.move.line": {
+                    "id", "move_id", "account_id", "date", "debit", "credit",
+                    "name", "ref", "journal_id", "parent_state", "partner_id",
+                },
+                "account.move": {"id", "name", "state", "journal_id", "ref"},
+                "account.invoice": set(),
+                "account.journal": {"id", "name", "code"},
+                "account.bank.statement.line": set(),
+                "account.batch.payment": set(),
+            }.get(model, set())
+
+        def search_read_pages(self, model, _domain, requested):
+            rows = {
+                "account.account": [{
+                    "id": 1,
+                    "code": "430000000001" if system == "source" else "430000",
+                    "code_store": "430000",
+                    "name": "Receivables",
+                }],
+                "account.move.line": [{
+                    "id": 2,
+                    "move_id": [9, "Move"],
+                    "account_id": [1, "Receivables"],
+                    "date": "2026-01-15",
+                    "debit": 10,
+                    "credit": 0,
+                    "name": "Invoice",
+                    "ref": "INV/1",
+                    "journal_id": [5, "Sales"],
+                    "parent_state": "posted",
+                    "partner_id": [42, "Example Partner"],
+                }],
+            }.get(model, [])
+            for row in rows:
+                yield {key: value for key, value in row.items() if key in requested}
+
+        def read(self, model, ids, requested):
+            rows = {
+                "account.move": [{
+                    "id": 9, "name": "MOVE/9", "state": "posted", "journal_id": [5, "Sales"],
+                    "ref": "INV/1",
+                }],
+                "account.journal": [{"id": 5, "name": "Sales", "code": "SAL"}],
+            }.get(model, [])
+            return [
+                {key: value for key, value in row.items() if key in requested}
+                for row in rows if row["id"] in ids
+            ]
+
+    reader = OpenERPReader(JournalItemClient()) if system == "source" else OdooReader(JournalItemClient())
+    item = reader.journal_items(
+        1, date(2026, 1, 1), date(2026, 1, 31), "posted"
+    )[0]
+    assert item.partner_id == 42
+
+
 def test_open_erp_cumulative_timeout_does_not_block_period_comparison(monkeypatch):
     reader = OpenERPReader(SimpleNamespace(client=SimpleNamespace(major_version="5.0")))
 

@@ -44,6 +44,7 @@ class JournalItem:
     sync_classification: str = ""
     sync_reason: str = ""
     mapped_account_code: str = ""
+    partner_id: int | None = None
 
 
 @dataclass

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { netBalance } from "./amounts.js";
+import { filterJournalItems, ledgerUrl } from "./ledger.js";
 
 const today = new Date();
 const dateValue = (date) => {
@@ -32,6 +33,7 @@ function LedgerDetails({ account, runId }) {
   const [comparison, setComparison] = useState(null);
   const [completeComparison, setCompleteComparison] = useState(null);
   const [showMatched, setShowMatched] = useState(false);
+  const [filters, setFilters] = useState({ dateFrom: "", dateTo: "", journal: "", partnerId: "", text: "" });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -77,6 +79,7 @@ function LedgerDetails({ account, runId }) {
   if (error && !comparison) return <p className="error-inline">{error}</p>;
   const data = showMatched ? completeComparison : comparison;
   if (!data) return null;
+  const journals = [...new Set([...data.source_items, ...data.target_items].map((item) => item.journal).filter(Boolean))].sort();
 
   return (
     <>
@@ -87,32 +90,41 @@ function LedgerDetails({ account, runId }) {
         </button>
       </div>}
       {error && <p className="error-inline">{error}</p>}
+      <div className="ledger-filters">
+        <label>Accounting date from<input type="date" value={filters.dateFrom} onChange={(event) => setFilters({ ...filters, dateFrom: event.target.value })} /></label>
+        <label>Accounting date to<input type="date" value={filters.dateTo} onChange={(event) => setFilters({ ...filters, dateTo: event.target.value })} /></label>
+        <label>Journal<select value={filters.journal} onChange={(event) => setFilters({ ...filters, journal: event.target.value })}><option value="">All journals</option>{journals.map((journal) => <option key={journal}>{journal}</option>)}</select></label>
+        <label>Partner ID<input inputMode="numeric" value={filters.partnerId} onChange={(event) => setFilters({ ...filters, partnerId: event.target.value })} placeholder="Exact ID" /></label>
+        <label>Search<input value={filters.text} onChange={(event) => setFilters({ ...filters, text: event.target.value })} placeholder="Entry, description, origin…" /></label>
+        <button type="button" className="matched-toggle" onClick={() => setFilters({ dateFrom: "", dateTo: "", journal: "", partnerId: "", text: "" })}>Clear filters</button>
+      </div>
       <div className="details-grid">
         <section>
           <h3>OpenERP journal items</h3>
-          <JournalItems lines={data.source_items} system="source" showMatched={showMatched} />
+          <JournalItems lines={data.source_items} system="source" showMatched={showMatched} filters={filters} />
         </section>
         <section>
           <h3>Odoo journal items</h3>
-          <JournalItems lines={data.target_items} system="target" showMatched={showMatched} />
+          <JournalItems lines={data.target_items} system="target" showMatched={showMatched} filters={filters} />
         </section>
       </div>
     </>
   );
 }
 
-function JournalItems({ lines, system, showMatched }) {
+function JournalItems({ lines, system, showMatched, filters }) {
   const [visibleCount, setVisibleCount] = useState(100);
-  const visibleLines = lines.slice(0, visibleCount);
-  if (!lines.length) return <p className="muted">{showMatched ? "No journal items in this period." : "No unmatched journal items in this period."}</p>;
+  const filteredLines = filterJournalItems(lines, filters);
+  const visibleLines = filteredLines.slice(0, visibleCount);
+  if (!filteredLines.length) return <p className="muted">No journal items match these filters.</p>;
   return (
     <>
     <div className="detail-table-wrap">
       <table className="detail-table">
-        <thead><tr><th>Date</th><th>Journal</th><th>Entry</th><th>Origin</th><th>Debit</th><th>Credit</th></tr></thead>
+        <thead><tr><th>Date</th><th>Journal</th><th>Partner ID</th><th>Entry</th><th>Origin</th><th>Debit</th><th>Credit</th></tr></thead>
         <tbody>{visibleLines.map((line) => (
           <tr key={`${line.system}-${line.line_id}`}>
-            <td>{line.date}</td><td>{line.journal || "—"}</td>
+            <td>{line.date}</td><td>{line.journal || "—"}</td><td>{line.partner_id ?? "—"}</td>
             <td><strong>{line.move_label || line.move_id}</strong><small>AML {line.line_id} · {line.description}</small></td>
             <td>{line.source_model ? `${line.source_model} #${line.source_id}` : line.is_native ? "Odoo native" : "Unidentified"}{line.is_reversal ? <small>Reversal</small> : null}{line.matched ? <small className="matched-indicator">Matches other ERP</small> : null}</td>
             <td>{money(line.debit)}</td><td>{money(line.credit)}</td>
@@ -120,7 +132,7 @@ function JournalItems({ lines, system, showMatched }) {
         ))}</tbody>
       </table>
     </div>
-    {visibleLines.length < lines.length && <button className="load-more" onClick={() => setVisibleCount((count) => count + 100)}>{`Load more (${visibleLines.length} of ${lines.length})`}</button>}
+    {visibleLines.length < filteredLines.length && <button className="load-more" onClick={() => setVisibleCount((count) => count + 100)}>{`Load more (${visibleLines.length} of ${filteredLines.length})`}</button>}
     </>
   );
 }
@@ -189,6 +201,10 @@ function IssueCard({ issue, onReview }) {
 }
 
 export default function App() {
+  return window.location.pathname === "/ledger" ? <LedgerPage /> : <ReconciliationDashboard />;
+}
+
+function ReconciliationDashboard() {
   const [companies, setCompanies] = useState([]);
   const [runs, setRuns] = useState([]);
   const [run, setRun] = useState(null);
@@ -346,7 +362,7 @@ function AccountRow({ row, runId, expanded, onToggle }) {
   const status = row.status || "balanced";
   return <>
     <tr className={`account-row status-row-${status}`} onClick={onToggle} tabIndex="0" onKeyDown={(event) => { if (event.key === "Enter") onToggle(); }}>
-      <td><button className="account-link" onClick={(event) => { event.stopPropagation(); onToggle(); }}><span className="expand-icon">{expanded ? "−" : "+"}</span><span><strong>{row.account_code} · {row.account_name || "Account"}</strong><small>OpenERP: {(row.source_account_codes || []).join(", ") || "No mapped source movement"}</small></span></button></td>
+      <td><button className="account-link" onClick={(event) => { event.stopPropagation(); onToggle(); }}><span className="expand-icon">{expanded ? "−" : "+"}</span><span><strong>{row.account_code} · {row.account_name || "Account"}</strong><small>OpenERP: {(row.source_account_codes || []).join(", ") || "No mapped source movement"}</small></span></button><a className="ledger-new-tab" href={ledgerUrl(runId, row.account_code)} target="_blank" rel="noopener noreferrer" onClick={(event) => event.stopPropagation()}>Open ledger in new tab ↗</a></td>
       <td>{money(row.source_debit)}</td><td>{money(row.source_credit)}</td><td>{money(netBalance(row.source_debit, row.source_credit))}</td>
       <td>{money(row.target_debit)}<small className="split">Synced {money(row.target_synced_debit)} · Native {money(row.target_native_debit)}</small></td>
       <td>{money(row.target_credit)}<small className="split">Synced {money(row.target_synced_credit)} · Native {money(row.target_native_credit)}</small></td><td>{money(netBalance(row.target_debit, row.target_credit))}</td>
@@ -355,4 +371,45 @@ function AccountRow({ row, runId, expanded, onToggle }) {
     </tr>
     {expanded && <tr className="details-row"><td colSpan="9"><LedgerDetails account={row} runId={runId} /></td></tr>}
   </>;
+}
+
+function LedgerPage() {
+  const params = new URLSearchParams(window.location.search);
+  const runId = params.get("run_id");
+  const accountCode = params.get("account_code");
+  const [run, setRun] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!runId || !accountCode) {
+      setError("A reconciliation run and account are required.");
+      setLoading(false);
+      return;
+    }
+    request(`/runs/${encodeURIComponent(runId)}`)
+      .then(setRun)
+      .catch((loadError) => setError(loadError.message))
+      .finally(() => setLoading(false));
+  }, [runId]);
+
+  const account = run?.accounts.find((item) => item.account_code === accountCode);
+  return (
+    <main className="app-shell">
+      <header className="topbar">
+        <a className="brand" href="/"><span className="brand-mark">S</span><span>Som Energia<small>Accounting controls</small></span></a>
+        <div className="topbar-right"><span className="live-dot" /> Read-only · EUR</div>
+      </header>
+      <div className="content">
+        <section className="hero">
+          <div><p className="eyebrow">LEDGER DETAIL · {run?.company.name || "ACCOUNTING"}</p><h1>Account {accountCode || ""}</h1><p className="hero-copy">{account?.account_name} · {run?.date_from} to {run?.date_to}</p></div>
+        </section>
+        {loading && <p className="muted">Loading reconciliation…</p>}
+        {error && <div role="alert" className="error-banner">{error}</div>}
+        {!loading && !error && !account && <div role="alert" className="error-banner">Account not found in this reconciliation.</div>}
+        {account && <section className="panel ledger-page-panel"><LedgerDetails account={account} runId={runId} /></section>}
+        <footer><a className="source-link" href="/">Back to reconciliation</a> · Read-only ledger access · all amounts in EUR</footer>
+      </div>
+    </main>
+  );
 }
