@@ -182,6 +182,7 @@ input:focus, select:focus, textarea:focus { border-color: #168165; box-shadow: 0
 .load-more { margin-top: 9px; padding: 7px 10px; border: 1px solid #dce7e2; border-radius: 6px; background: #fff; color: #27634f; cursor: pointer; font-size: 10px; font-weight: 700; }
 .load-more:disabled { cursor: wait; opacity: .6; }
 footer { padding: 20px 0 8px; color: #94a19b; font-size: 10px; text-align: center; }
+.source-link { color: inherit; text-decoration: underline; }
 
 @media (max-width: 1050px) {
   .filters { grid-template-columns: repeat(3, 1fr); }

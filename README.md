@@ -2,6 +2,10 @@
 
 External, read-only web application for comparing OpenERP and Odoo accounting movements.
 
+## License
+
+This project is licensed under the GNU Affero General Public License, version 3 or (at your option) any later version. See [LICENSE](LICENSE). The application footer links to this public source repository for network users.
+
 The application is intentionally separate from both ERP codebases. It reads journal items through each system's XML-RPC API and stores report snapshots and accountant review notes in its own SQLite database.
 
 ## Initial scope
