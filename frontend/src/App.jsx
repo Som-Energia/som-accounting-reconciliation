@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { netBalance } from "./amounts.js";
 
 const today = new Date();
 const dateValue = (date) => {
@@ -279,12 +280,12 @@ export default function App() {
             </div>
             <div className="table-wrap">
               <table className="account-table">
-                <thead><tr><th>Odoo account / source accounts</th><th>OpenERP debit</th><th>OpenERP credit</th><th>Odoo debit</th><th>Odoo credit</th><th>Balance Δ</th><th>Company closing · info</th><th>Status</th></tr></thead>
-                <tbody>{accountRows.map((row) => <AccountRow key={row.account_code} row={row} runId={run.id} cumulativeAvailable={run.cumulative_data_available} expanded={expanded === row.account_code} onToggle={() => setExpanded(expanded === row.account_code ? "" : row.account_code)} />)}</tbody>
+                <thead><tr><th>Odoo account / source accounts</th><th>OpenERP debit</th><th>OpenERP credit</th><th>OpenERP balance</th><th>Odoo debit</th><th>Odoo credit</th><th>Odoo balance</th><th>Difference</th><th>Status</th></tr></thead>
+                <tbody>{accountRows.map((row) => <AccountRow key={row.account_code} row={row} runId={run.id} expanded={expanded === row.account_code} onToggle={() => setExpanded(expanded === row.account_code ? "" : row.account_code)} />)}</tbody>
               </table>
               {accountRows.length === 0 && <p className="empty-state">No accounts match this filter.</p>}
             </div>
-            <p className="table-footnote">Odoo debit and credit include the company-native portion shown separately in each account detail. {run.pending_adjustment_available === false ? "Pending operations are listed separately; their AML amounts are not offset in aggregate mode, so differences remain temporal until close." : "Pending source operations are removed from the definitive difference."} Closing balances are not comparable until opening entries are validated. Account drill-down reads current ledger details on demand.</p>
+            <p className="table-footnote">OpenERP and Odoo balances are net period movements (debit minus credit), not cumulative closing balances. Odoo debit and credit include the company-native portion shown separately in each account detail. Difference keeps the existing definitive calculation and may differ from subtracting the displayed balances when pending source movements are adjusted. {run.pending_adjustment_available === false ? "Pending operations are listed separately; their AML amounts are not offset in aggregate mode, so differences remain temporal until close." : "Pending source operations are removed from the definitive difference."} Closing balances are not comparable until opening entries are validated. Account drill-down reads current ledger details on demand.</p>
           </section>
 
           <IssuePanel issues={run.issues || []} onReview={updateIssue} />
@@ -299,18 +300,17 @@ function SummaryCard({ label, value, caption, warning }) {
   return <article className={`summary-card ${warning ? "summary-warning" : ""}`}><span>{label}</span><strong>{value}</strong><small>{caption}</small></article>;
 }
 
-function AccountRow({ row, runId, cumulativeAvailable, expanded, onToggle }) {
+function AccountRow({ row, runId, expanded, onToggle }) {
   const status = row.status || "balanced";
   return <>
     <tr className={`account-row status-row-${status}`} onClick={onToggle} tabIndex="0" onKeyDown={(event) => { if (event.key === "Enter") onToggle(); }}>
       <td><button className="account-link" onClick={(event) => { event.stopPropagation(); onToggle(); }}><span className="expand-icon">{expanded ? "−" : "+"}</span><span><strong>{row.account_code} · {row.account_name || "Account"}</strong><small>OpenERP: {(row.source_account_codes || []).join(", ") || "No mapped source movement"}</small></span></button></td>
-      <td>{money(row.source_debit)}</td><td>{money(row.source_credit)}</td>
+      <td>{money(row.source_debit)}</td><td>{money(row.source_credit)}</td><td>{money(netBalance(row.source_debit, row.source_credit))}</td>
       <td>{money(row.target_debit)}<small className="split">Synced {money(row.target_synced_debit)} · Native {money(row.target_native_debit)}</small></td>
-      <td>{money(row.target_credit)}<small className="split">Synced {money(row.target_synced_credit)} · Native {money(row.target_native_credit)}</small></td>
+      <td>{money(row.target_credit)}<small className="split">Synced {money(row.target_synced_credit)} · Native {money(row.target_native_credit)}</small></td><td>{money(netBalance(row.target_debit, row.target_credit))}</td>
       <td className={row.definitive_debit_difference === "0.00" && row.definitive_credit_difference === "0.00" ? "amount-ok" : "amount-diff"}>{money(row.definitive_balance_difference)}<small className="split">D {money(row.definitive_debit_difference)} · C {money(row.definitive_credit_difference)}</small>{row.pending_debit !== "0.00" || row.pending_credit !== "0.00" ? <small className="split">Deferred {money(row.pending_debit)} / {money(row.pending_credit)}</small> : null}</td>
-      <td>{cumulativeAvailable ? <><strong>OpenERP {money(row.cumulative_source_balance)}</strong><small className="split">Odoo {money(row.cumulative_target_balance)}</small></> : "—"}</td>
       <td><span className={`badge badge-${status}`}>{status.replaceAll("_", " ")}</span>{row.pending_debit !== "0.00" || row.pending_credit !== "0.00" ? <small><span className="badge badge-pending_sync">pending</span></small> : null}</td>
     </tr>
-    {expanded && <tr className="details-row"><td colSpan="8"><LedgerDetails account={row} runId={runId} /></td></tr>}
+    {expanded && <tr className="details-row"><td colSpan="9"><LedgerDetails account={row} runId={runId} /></td></tr>}
   </>;
 }
