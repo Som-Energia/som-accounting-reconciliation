@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from .domain import JournalItem, decimal_amount
 
@@ -43,6 +44,32 @@ class ReadOnlyERP(Protocol):
     ) -> list[JournalItem]: ...
 
 
+def _safe_endpoint(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        if not parsed.scheme or not hostname:
+            return "<invalid endpoint>"
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        if parsed.port:
+            hostname = f"{hostname}:{parsed.port}"
+        return f"{parsed.scheme}://{hostname}"
+    except ValueError:
+        return "<invalid endpoint>"
+
+
+class ERPAuthenticationError(ValueError):
+    def __init__(self, system: str, config: dict[str, Any]):
+        self.system = system
+        self.endpoint = _safe_endpoint(str(config.get("url") or ""))
+        self.database = str(config.get("database") or "<missing>")
+        self.username = str(config.get("username") or "<missing>")
+        super().__init__(
+            f"{system} authentication failed for the configured read-only user."
+        )
+
+
 @dataclass(frozen=True)
 class ERPProfile:
     key: str
@@ -75,24 +102,35 @@ class ErpPeekReaderClient:
         password = _read_secret(config)
         if not config.get("url") or not config.get("database") or not config.get("username"):
             raise ValueError("ERP URL, database, and username must be configured.")
+        erppeek_error_type: type[Exception] | None = None
         if client_factory is None:
             try:
-                from erppeek import Client
+                from erppeek import Client, Error as ErpPeekError
             except ImportError as error:
                 raise ValueError("The erppeek package is required for the OpenERP connector.") from error
             client_factory = Client
+            erppeek_error_type = ErpPeekError
         transport = (
             _BoundedSafeTransport()
             if config["url"].startswith("https:")
             else _BoundedTransport()
         )
-        self.client = client_factory(
-            config["url"],
-            config["database"],
-            config["username"],
-            password,
-            transport=transport,
-        )
+        try:
+            self.client = client_factory(
+                config["url"],
+                config["database"],
+                config["username"],
+                password,
+                transport=transport,
+            )
+        except Exception as error:
+            if (
+                erppeek_error_type is not None
+                and isinstance(error, erppeek_error_type)
+                and str(error) == "Invalid username or password"
+            ):
+                raise ERPAuthenticationError("OpenERP", config) from error
+            raise
 
     def fields(self, model: str) -> set[str]:
         return set(self.client.fields(model))
@@ -180,7 +218,7 @@ class OdooXMLRPCReader:
             self.database, self.config["username"], self.password, {}
         )
         if not uid:
-            raise ValueError("ERP authentication failed for the configured read-only user.")
+            raise ERPAuthenticationError("Odoo", self.config)
         return int(uid)
 
     def _execute(self, model: str, method: str, *args: Any, **kwargs: Any) -> Any:
